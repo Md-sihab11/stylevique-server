@@ -1709,18 +1709,6 @@ const APPOINTMENT_STATUSES = Object.freeze([
 
 const ADMIN_APPOINTMENT_ACTIONS = Object.freeze(["confirmed", "cancelled"]);
 
-const appointmentCreateSchema = z
-    .object({
-        serviceId: objectIdStringSchema,
-        appointmentDate: z
-            .string()
-            .trim()
-            .regex(/^\d{4}-\d{2}-\d{2}$/, "Use the YYYY-MM-DD date format."),
-        timeSlot: z.enum(TIME_SLOTS),
-        message: z.string().trim().max(1000).optional().default(""),
-    })
-    .strict();
-
 const appointmentListQuerySchema = z.object({
     status: optionalEnumQuery(APPOINTMENT_STATUSES),
     page: pageQueryField(),
@@ -1754,17 +1742,85 @@ app.post(
     bookingLimiter,
     verifyToken,
     verifyCustomer,
-    validateBody(appointmentCreateSchema),
     async (req, res) => {
-        const { serviceId, appointmentDate, timeSlot, message } = req.body;
+        const body = req.body || {};
+        const errors = [];
+        const allowedFields = [
+            "serviceId",
+            "appointmentDate",
+            "timeSlot",
+            "message",
+        ];
 
-        const serviceObjectId = parseObjectId(serviceId);
-        const service = serviceObjectId
-            ? await servicesCollection.findOne({
-                _id: serviceObjectId,
-                status: "active",
-            })
-            : null;
+        for (const field of Object.keys(body)) {
+            if (!allowedFields.includes(field)) {
+                errors.push({
+                    field,
+                    message:
+                        "Only serviceId, appointmentDate, timeSlot and message are allowed.",
+                });
+            }
+        }
+
+        const serviceId =
+            typeof body.serviceId === "string" ? body.serviceId.trim() : "";
+        const appointmentDate =
+            typeof body.appointmentDate === "string"
+                ? body.appointmentDate.trim()
+                : "";
+        const timeSlot =
+            typeof body.timeSlot === "string" ? body.timeSlot.trim() : "";
+        const message =
+            body.message === undefined
+                ? ""
+                : typeof body.message === "string"
+                    ? body.message.trim()
+                    : null;
+
+        if (!ObjectId.isValid(serviceId)) {
+            errors.push({
+                field: "serviceId",
+                message: "Service ID must be a valid MongoDB ObjectId.",
+            });
+        }
+
+        if (
+            !/^\d{4}-\d{2}-\d{2}$/.test(appointmentDate) ||
+            !parseAppointmentDateTime(appointmentDate, "12:00")
+        ) {
+            errors.push({
+                field: "appointmentDate",
+                message: "Use a real date in the YYYY-MM-DD format.",
+            });
+        }
+
+        if (!TIME_SLOTS.includes(timeSlot)) {
+            errors.push({
+                field: "timeSlot",
+                message: "Choose one of the available salon time slots.",
+            });
+        }
+
+        if (message === null || message.length > 1000) {
+            errors.push({
+                field: "message",
+                message: "Message must be text with 1000 characters or fewer.",
+            });
+        }
+
+        if (errors.length > 0) {
+            return sendError(
+                res,
+                422,
+                "Validation failed. Please check the submitted fields.",
+                errors,
+            );
+        }
+
+        const service = await servicesCollection.findOne({
+            _id: new ObjectId(serviceId),
+            status: "active",
+        });
 
         if (!service) {
             return sendError(res, 404, "Service not found or is not available.");
@@ -1780,12 +1836,11 @@ app.post(
 
         const activeSlotKey = buildActiveSlotKey(appointmentDate, timeSlot);
 
-        // This early check gives a friendly error in the common case. The unique
-        // partial index below is what actually protects against concurrent
-        // requests racing each other.
+        // This friendly check handles the normal case. The unique partial index
+        // on activeSlotKey is what stops two simultaneous requests from both
+        // booking the same slot.
         const slotAlreadyBooked = await appointmentsCollection.findOne({
             activeSlotKey,
-            status: { $in: ["pending", "confirmed"] },
         });
 
         if (slotAlreadyBooked) {
@@ -1797,7 +1852,6 @@ app.post(
         }
 
         const now = new Date();
-
         const appointmentDocument = {
             serviceId: service._id,
             customerId: req.user.id, // From the verified JWT, never from req.body.
@@ -1814,7 +1868,9 @@ app.post(
         };
 
         try {
-            const result = await appointmentsCollection.insertOne(appointmentDocument);
+            const result = await appointmentsCollection.insertOne(
+                appointmentDocument,
+            );
 
             return sendSuccess(
                 res,
@@ -1828,6 +1884,8 @@ app.post(
                 201,
             );
         } catch (error) {
+            // 11000 is MongoDB's duplicate-key error code. It means another
+            // request inserted this activeSlotKey a moment before us.
             if (error?.code === 11000) {
                 return sendError(
                     res,
