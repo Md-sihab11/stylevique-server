@@ -259,7 +259,7 @@ async function connectToMongoDB() {
 
         // Better Auth owns the user collection. The other three collections
         // belong to this API.
-        usersCollection = database.collection(AUTH_USER_COLLECTION);
+        usersCollection = database.collection(AUTH_USER);
         servicesCollection = database.collection("services");
         appointmentsCollection = database.collection("appointments");
         transactionsCollection = database.collection("transactions");
@@ -470,11 +470,6 @@ function parseObjectId(value) {
     }
 }
 
-const objectIdStringSchema = z
-    .string()
-    .trim()
-    .regex(/^[a-fA-F0-9]{24}$/, "Must be a valid MongoDB ObjectId.");
-
 /**
  * Better Auth exposes user.id as a string while the MongoDB adapter stores the
  * actual primary key in _id (normally as an ObjectId). This filter supports
@@ -679,66 +674,50 @@ function roundMoney(value) {
 }
 
 // Stripe expects the smallest currency unit. Most currencies use 2 decimals,
-// but some use 0 or 3. Getting this wrong would charge the customer 100x more
-// or less, so it is handled explicitly.
-const ZERO_DECIMAL_CURRENCIES = new Set([
-    "bif",
-    "clp",
-    "djf",
-    "gnf",
-    "jpy",
-    "kmf",
-    "krw",
-    "mga",
-    "pyg",
-    "rwf",
-    "ugx",
-    "vnd",
-    "vuv",
-    "xaf",
-    "xof",
-    "xpf",
-]);
+// but some use 0 or 3. Getting this wrong would charge the customer 100 times
+// too much or too little.
+const CURRENCY_DECIMALS = {
+    bif: 0,
+    clp: 0,
+    djf: 0,
+    gnf: 0,
+    jpy: 0,
+    kmf: 0,
+    krw: 0,
+    mga: 0,
+    pyg: 0,
+    rwf: 0,
+    ugx: 0,
+    vnd: 0,
+    vuv: 0,
+    xaf: 0,
+    xof: 0,
+    xpf: 0,
+    bhd: 3,
+    jod: 3,
+    kwd: 3,
+    omr: 3,
+    tnd: 3,
+};
 
-const THREE_DECIMAL_CURRENCIES = new Set([
-    "bhd",
-    "jod",
-    "kwd",
-    "omr",
-    "tnd",
-]);
+function getCurrencyDecimals(currency) {
+    return CURRENCY_DECIMALS[String(currency).toLowerCase()] ?? 2;
+}
 
 function toMinorCurrencyUnits(amount, currency) {
-    const normalizedCurrency = String(currency).toLowerCase();
     const numericAmount = Number(amount);
 
     if (!Number.isFinite(numericAmount) || numericAmount <= 0) {
         throw new AppError(400, "The appointment amount is invalid.");
     }
 
-    if (ZERO_DECIMAL_CURRENCIES.has(normalizedCurrency)) {
-        return Math.round(numericAmount);
-    }
-
-    if (THREE_DECIMAL_CURRENCIES.has(normalizedCurrency)) {
-        return Math.round(numericAmount * 1000);
-    }
-
-    return Math.round(numericAmount * 100);
+    return Math.round(numericAmount * 10 ** getCurrencyDecimals(currency));
 }
 
 function fromMinorCurrencyUnits(amount, currency) {
-    const normalizedCurrency = String(currency).toLowerCase();
-
-    if (ZERO_DECIMAL_CURRENCIES.has(normalizedCurrency)) {
-        return Number(amount);
-    }
-
-    if (THREE_DECIMAL_CURRENCIES.has(normalizedCurrency)) {
-        return roundMoney(Number(amount) / 1000);
-    }
-
-    return roundMoney(Number(amount) / 100);
+    return roundMoney(
+        Number(amount) / 10 ** getCurrencyDecimals(currency),
+    );
 }
 
 // Shared Zod helpers for query strings.
@@ -2449,51 +2428,35 @@ app.patch(
 // 15. DASHBOARD RELATED APIs
 // ========================================
 
-async function getAppointmentStatusCounts(matchFilter = {}) {
-    const rows = await appointmentsCollection
-        .aggregate([
-            ...(Object.keys(matchFilter).length ? [{ $match: matchFilter }] : []),
-            {
-                $group: {
-                    _id: "$status",
-                    count: { $sum: 1 },
-                },
-            },
-        ])
-        .toArray();
-
-    const counts = {
-        pending: 0,
-        confirmed: 0,
-        cancelled: 0,
-    };
-
-    for (const row of rows) {
-        if (Object.prototype.hasOwnProperty.call(counts, row._id)) {
-            counts[row._id] = row.count;
-        }
-    }
-
-    return {
-        ...counts,
-        total: counts.pending + counts.confirmed + counts.cancelled,
-    };
-}
-
 app.get(
     "/api/dashboard/customer",
     verifyToken,
     verifyCustomer,
     async (req, res) => {
-        const counts = await getAppointmentStatusCounts({
-            customerId: req.user.id,
-        });
+        const customerId = req.user.id;
+
+        const [pendingAppointments, confirmedAppointments, cancelledAppointments] =
+            await Promise.all([
+                appointmentsCollection.countDocuments({
+                    customerId,
+                    status: "pending",
+                }),
+                appointmentsCollection.countDocuments({
+                    customerId,
+                    status: "confirmed",
+                }),
+                appointmentsCollection.countDocuments({
+                    customerId,
+                    status: "cancelled",
+                }),
+            ]);
 
         return sendSuccess(res, "Customer dashboard retrieved successfully.", {
-            totalAppointments: counts.total,
-            pendingAppointments: counts.pending,
-            confirmedAppointments: counts.confirmed,
-            cancelledAppointments: counts.cancelled,
+            totalAppointments:
+                pendingAppointments + confirmedAppointments + cancelledAppointments,
+            pendingAppointments,
+            confirmedAppointments,
+            cancelledAppointments,
         });
     },
 );
@@ -2503,37 +2466,43 @@ app.get(
     verifyToken,
     verifyAdmin,
     async (req, res) => {
-        const [totalRegisteredCustomers, totalActiveServices, appointmentCounts, paymentRows] =
-            await Promise.all([
-                usersCollection.countDocuments({ role: { $ne: "admin" } }),
-                servicesCollection.countDocuments({ status: "active" }),
-                getAppointmentStatusCounts(),
-                transactionsCollection
-                    .aggregate([
-                        { $match: { status: "paid" } },
-                        {
-                            $group: {
-                                _id: null,
-                                count: { $sum: 1 },
-                                totalAmount: { $sum: "$amount" },
-                            },
+        const [
+            totalRegisteredCustomers,
+            totalActiveServices,
+            pendingAppointments,
+            confirmedAppointments,
+            cancelledAppointments,
+            paymentRows,
+        ] = await Promise.all([
+            usersCollection.countDocuments({ role: { $ne: "admin" } }),
+            servicesCollection.countDocuments({ status: "active" }),
+            appointmentsCollection.countDocuments({ status: "pending" }),
+            appointmentsCollection.countDocuments({ status: "confirmed" }),
+            appointmentsCollection.countDocuments({ status: "cancelled" }),
+            transactionsCollection
+                .aggregate([
+                    { $match: { status: "paid" } },
+                    {
+                        $group: {
+                            _id: null,
+                            count: { $sum: 1 },
+                            totalAmount: { $sum: "$amount" },
                         },
-                    ])
-                    .toArray(),
-            ]);
+                    },
+                ])
+                .toArray(),
+        ]);
 
-        const paymentSummary = paymentRows[0] ?? {
-            count: 0,
-            totalAmount: 0,
-        };
+        const paymentSummary = paymentRows[0] ?? { count: 0, totalAmount: 0 };
 
         return sendSuccess(res, "Admin dashboard retrieved successfully.", {
             totalRegisteredCustomers,
             totalActiveServices,
-            totalAppointments: appointmentCounts.total,
-            pendingAppointments: appointmentCounts.pending,
-            confirmedAppointments: appointmentCounts.confirmed,
-            cancelledAppointments: appointmentCounts.cancelled,
+            totalAppointments:
+                pendingAppointments + confirmedAppointments + cancelledAppointments,
+            pendingAppointments,
+            confirmedAppointments,
+            cancelledAppointments,
             totalSuccessfulPayments: paymentSummary.count,
             totalRevenue: roundMoney(paymentSummary.totalAmount || 0),
             currency: STRIPE_CURRENCY,
@@ -2545,24 +2514,9 @@ app.get(
 // 16. STRIPE CHECKOUT APIs
 // ========================================
 
-const checkoutRequestSchema = z
-    .object({
-        appointmentId: objectIdStringSchema,
-    })
-    .strict();
-
 const paymentVerifyQuerySchema = z.object({
     session_id: z.string().trim().min(5).max(255),
 });
-
-function requireStripeConfiguration() {
-    if (!stripe) {
-        throw new AppError(
-            503,
-            "Stripe payments are not configured yet. Add STRIPE_SECRET_KEY on the server.",
-        );
-    }
-}
 
 function getPaymentIntentId(checkoutSession) {
     if (typeof checkoutSession.payment_intent === "string") {
@@ -2649,14 +2603,37 @@ app.post(
     checkoutLimiter,
     verifyToken,
     verifyCustomer,
-    validateBody(checkoutRequestSchema),
     async (req, res) => {
-        requireStripeConfiguration();
+        if (!stripe) {
+            return sendError(
+                res,
+                503,
+                "Stripe payments are not configured yet. Add STRIPE_SECRET_KEY on the server.",
+            );
+        }
 
-        const appointmentObjectId = parseObjectId(req.body.appointmentId);
+        const body = req.body || {};
+
+        if (
+            Object.keys(body).length !== 1 ||
+            typeof body.appointmentId !== "string" ||
+            !ObjectId.isValid(body.appointmentId)
+        ) {
+            return sendError(
+                res,
+                422,
+                "Validation failed. Please check the submitted fields.",
+                [
+                    {
+                        field: "appointmentId",
+                        message: "A valid appointmentId is required.",
+                    },
+                ],
+            );
+        }
 
         const appointment = await appointmentsCollection.findOne({
-            _id: appointmentObjectId,
+            _id: new ObjectId(body.appointmentId),
             customerId: req.user.id,
         });
 
@@ -2680,8 +2657,8 @@ app.post(
             );
         }
 
-        // The amount comes from the price snapshot saved at booking time. The
-        // frontend cannot choose or change it.
+        // The amount comes from the price saved at booking time. The browser
+        // cannot choose or change the amount.
         const amount = toMinorCurrencyUnits(
             appointment.servicePrice,
             STRIPE_CURRENCY,
@@ -2714,9 +2691,8 @@ app.post(
         try {
             checkoutSession = await stripe.checkout.sessions.create({
                 mode: "payment",
-                // Do not send payment_method_types here. Stripe now manages the
-                // enabled payment methods from the Dashboard, and sending this older
-                // parameter can be rejected by newer Stripe accounts/API versions.
+                // Stripe manages enabled payment methods from the dashboard.
+                // Do not send the older payment_method_types parameter here.
                 line_items: [
                     {
                         quantity: 1,
@@ -2724,7 +2700,9 @@ app.post(
                             currency: STRIPE_CURRENCY,
                             unit_amount: amount,
                             product_data: {
-                                name: appointment.serviceSnapshot?.serviceName || "Salon service",
+                                name:
+                                    appointment.serviceSnapshot?.serviceName ||
+                                    "Salon service",
                                 description: `${appointment.appointmentDate} at ${appointment.timeSlot}`,
                             },
                         },
@@ -2742,7 +2720,6 @@ app.post(
                 "Stripe Checkout Session creation failed:",
                 error?.type || error?.name || "UnknownError",
             );
-
             throw new AppError(
                 502,
                 "The payment session could not be created. Please try again.",
@@ -2756,6 +2733,8 @@ app.post(
             );
         }
 
+        // Save the session reference. If this write fails, the verified webhook
+        // can still complete the payment because Stripe has our metadata.
         try {
             await appointmentsCollection.updateOne(
                 { _id: appointment._id },
@@ -2772,9 +2751,6 @@ app.post(
                 },
             );
         } catch (error) {
-            // The Stripe Session itself is valid and contains our metadata, so the
-            // verified webhook can still complete the payment. Log the reference
-            // failure instead of charging the customer and then hiding the URL.
             console.error(
                 "Could not save the Stripe Checkout Session reference:",
                 error?.name || "DatabaseError",
