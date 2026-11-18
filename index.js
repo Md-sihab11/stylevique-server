@@ -224,214 +224,138 @@ app.use("/api", (req, res, next) => {
 // 5. MONGODB CONNECTION
 // ========================================
 
+// These variables are filled once when the server starts.
 let mongoClient = null;
 let database = null;
 let usersCollection = null;
 let servicesCollection = null;
 let appointmentsCollection = null;
 let transactionsCollection = null;
-
-let isDatabaseConnected = false;
 let supportsTransactions = false;
 
-/**
- * Connect once and reuse the same client for every request.
- * Throwing here stops startup with a clear error, because the API cannot work
- * without its database.
- */
-async function connectToDatabase() {
+async function connectToMongoDB() {
     if (mongoClient) {
         return database;
     }
 
     if (!MONGODB_URI) {
         throw new Error(
-            "MONGODB_URI is missing. Copy .env.example to .env and add your MongoDB Atlas connection string.",
+            "MONGODB_URI is missing. Copy .env.example to .env and add your MongoDB connection string.",
         );
     }
 
     const client = new MongoClient(MONGODB_URI, {
-        maxPoolSize: 10,
         serverSelectionTimeoutMS: 10000,
         connectTimeoutMS: 10000,
     });
 
     try {
         await client.connect();
-
         const connectedDatabase = client.db(DB_NAME);
         await connectedDatabase.command({ ping: 1 });
 
         mongoClient = client;
         database = connectedDatabase;
-        isDatabaseConnected = true;
 
-        initializeCollectionReferences();
-        await detectTransactionSupport();
+        // Better Auth owns the user collection. The other three collections
+        // belong to this API.
+        usersCollection = database.collection(AUTH_USER_COLLECTION);
+        servicesCollection = database.collection("services");
+        appointmentsCollection = database.collection("appointments");
+        transactionsCollection = database.collection("transactions");
+
+        // Atlas is a replica set, so multi-document transactions are available.
+        const serverInfo = await database.command({ hello: 1 });
+        supportsTransactions =
+            Boolean(serverInfo.setName) || serverInfo.msg === "isdbgrid";
+
+        return database;
     } catch (error) {
-        isDatabaseConnected = false;
         await client.close().catch(() => { });
+        mongoClient = null;
+        database = null;
 
         console.error("MongoDB connection failed:", error.message);
         throw new Error(
             "Could not connect to MongoDB. Check MONGODB_URI, your Atlas IP allowlist and network access.",
         );
     }
-
-    return database;
-}
-
-/**
- * Atlas runs as a replica set and supports multi-document transactions.
- * A local standalone MongoDB does not. We detect this while starting so the
- * payment webhook can gracefully fall back instead of crashing.
- */
-async function detectTransactionSupport() {
-    try {
-        const hello = await database.command({ hello: 1 });
-        supportsTransactions = Boolean(hello.setName) || hello.msg === "isdbgrid";
-    } catch {
-        supportsTransactions = false;
-    }
 }
 
 // ========================================
-// 6. DATABASE COLLECTIONS
+// 6. DATABASE INDEXES
 // ========================================
 
-function initializeCollectionReferences() {
-    // Better Auth owns this collection. We only read and update application
-    // fields such as role, isBlocked and phone. We never create a duplicate
-    // authentication system.
-    usersCollection = database.collection(AUTH_USER_COLLECTION);
-    servicesCollection = database.collection("services");
-    appointmentsCollection = database.collection("appointments");
-    transactionsCollection = database.collection("transactions");
-}
-
-// ========================================
-// 7. DATABASE INDEXES
-// ========================================
-
-/**
- * Create all indexes required by the application.
- * The unique partial index on activeSlotKey is the database-level guarantee
- * that two people cannot reserve the same salon date and time slot.
- */
 async function ensureDatabaseIndexes() {
-    const indexDefinitions = [
-        // Users (Better Auth collection): speeds up admin customer searches.
+    // The unique partial index on activeSlotKey is the database-level guarantee
+    // that two customers cannot reserve the same date and time slot.
+    await usersCollection.createIndex(
+        { role: 1, createdAt: -1 },
+        { name: "users_role_created" },
+    );
+    await servicesCollection.createIndex(
+        { status: 1, category: 1 },
+        { name: "services_status_category" },
+    );
+    await servicesCollection.createIndex({ price: 1 }, { name: "services_price" });
+    await servicesCollection.createIndex(
+        { createdAt: -1 },
+        { name: "services_created" },
+    );
+    await appointmentsCollection.createIndex(
+        { customerId: 1, createdAt: -1 },
+        { name: "appointments_customer_created" },
+    );
+    await appointmentsCollection.createIndex(
+        { status: 1, createdAt: -1 },
+        { name: "appointments_status_created" },
+    );
+    await appointmentsCollection.createIndex(
+        { appointmentDate: 1, timeSlot: 1 },
+        { name: "appointments_date_slot" },
+    );
+    await appointmentsCollection.createIndex(
+        { serviceId: 1 },
+        { name: "appointments_service" },
+    );
+    await appointmentsCollection.createIndex(
+        { activeSlotKey: 1 },
         {
-            collection: usersCollection,
-            keys: { role: 1, createdAt: -1 },
-            options: { name: "users_role_created" },
+            name: "appointments_unique_active_slot",
+            unique: true,
+            partialFilterExpression: { activeSlotKey: { $type: "string" } },
         },
+    );
+    await transactionsCollection.createIndex(
+        { customerId: 1, createdAt: -1 },
+        { name: "transactions_customer_created" },
+    );
+    await transactionsCollection.createIndex(
+        { appointmentId: 1 },
+        { name: "transactions_appointment" },
+    );
+    await transactionsCollection.createIndex(
+        { status: 1, createdAt: -1 },
+        { name: "transactions_status_created" },
+    );
+    await transactionsCollection.createIndex(
+        { stripeSessionId: 1 },
+        {
+            name: "transactions_unique_stripe_session",
+            unique: true,
+            partialFilterExpression: { stripeSessionId: { $type: "string" } },
+        },
+    );
+    await transactionsCollection.createIndex(
+        { stripeEventId: 1 },
+        {
+            name: "transactions_unique_stripe_event",
+            unique: true,
+            partialFilterExpression: { stripeEventId: { $type: "string" } },
+        },
+    );
 
-        // Services.
-        {
-            collection: servicesCollection,
-            keys: { status: 1, category: 1 },
-            options: { name: "services_status_category" },
-        },
-        {
-            collection: servicesCollection,
-            keys: { price: 1 },
-            options: { name: "services_price" },
-        },
-        {
-            collection: servicesCollection,
-            keys: { createdAt: -1 },
-            options: { name: "services_created" },
-        },
-
-        // Appointments.
-        {
-            collection: appointmentsCollection,
-            keys: { customerId: 1, createdAt: -1 },
-            options: { name: "appointments_customer_created" },
-        },
-        {
-            collection: appointmentsCollection,
-            keys: { status: 1, createdAt: -1 },
-            options: { name: "appointments_status_created" },
-        },
-        {
-            collection: appointmentsCollection,
-            keys: { appointmentDate: 1, timeSlot: 1 },
-            options: { name: "appointments_date_slot" },
-        },
-        {
-            collection: appointmentsCollection,
-            keys: { serviceId: 1 },
-            options: { name: "appointments_service" },
-        },
-        {
-            collection: appointmentsCollection,
-            keys: { activeSlotKey: 1 },
-            options: {
-                name: "appointments_unique_active_slot",
-                unique: true,
-                partialFilterExpression: { activeSlotKey: { $type: "string" } },
-            },
-        },
-
-        // Transactions.
-        {
-            collection: transactionsCollection,
-            keys: { customerId: 1, createdAt: -1 },
-            options: { name: "transactions_customer_created" },
-        },
-        {
-            collection: transactionsCollection,
-            keys: { appointmentId: 1 },
-            options: { name: "transactions_appointment" },
-        },
-        {
-            collection: transactionsCollection,
-            keys: { status: 1, createdAt: -1 },
-            options: { name: "transactions_status_created" },
-        },
-        {
-            collection: transactionsCollection,
-            keys: { stripeSessionId: 1 },
-            options: {
-                name: "transactions_unique_stripe_session",
-                unique: true,
-                partialFilterExpression: { stripeSessionId: { $type: "string" } },
-            },
-        },
-        {
-            collection: transactionsCollection,
-            keys: { stripeEventId: 1 },
-            options: {
-                name: "transactions_unique_stripe_event",
-                unique: true,
-                partialFilterExpression: { stripeEventId: { $type: "string" } },
-            },
-        },
-    ];
-
-    const createdIndexes = [];
-
-    for (const definition of indexDefinitions) {
-        try {
-            const indexName = await definition.collection.createIndex(
-                definition.keys,
-                definition.options,
-            );
-            createdIndexes.push(indexName);
-        } catch (error) {
-            console.error(
-                `Failed to create index "${definition.options.name}":`,
-                error.message,
-            );
-            throw new Error(
-                `Database index initialization failed (${definition.options.name}).`,
-            );
-        }
-    }
-
-    return createdIndexes;
+    return 14;
 }
 
 // ========================================
@@ -910,7 +834,7 @@ async function verifyToken(req, res, next) {
             );
         }
 
-        if (!isDatabaseConnected) {
+        if (!database) {
             return sendError(res, 503, "The database is currently unavailable.");
         }
 
@@ -3320,11 +3244,11 @@ function logConfigurationWarnings() {
 async function startServer() {
     logConfigurationWarnings();
 
-    await connectToDatabase();
+    await connectToMongoDB();
     const createdIndexes = await ensureDatabaseIndexes();
 
     console.log(
-        `MongoDB connected to database "${DB_NAME}". ${createdIndexes.length} indexes are ready.`,
+        `MongoDB connected to database "${DB_NAME}". ${createdIndexes} indexes are ready.`,
     );
     console.log(
         `Multi-document transactions: ${supportsTransactions ? "supported" : "not supported (sequential fallback active)"}`,
@@ -3372,7 +3296,6 @@ async function startServer() {
             });
             mongoClient = null;
             database = null;
-            isDatabaseConnected = false;
         }
 
         clearTimeout(forceExitTimer);
@@ -3433,7 +3356,7 @@ async function promoteAdminFromCli() {
         );
     }
 
-    await connectToDatabase();
+    await connectToMongoDB();
 
     try {
         const matchingUsers = await usersCollection
@@ -3487,7 +3410,6 @@ async function promoteAdminFromCli() {
             await mongoClient.close().catch(() => { });
             mongoClient = null;
             database = null;
-            isDatabaseConnected = false;
         }
     }
 }
