@@ -1,24 +1,38 @@
 {
   "name": "stylevique-server",
   "version": "1.0.0",
-  "description": "",
+  "description": "Stylevique salon appointment booking REST API built with Express.js, MongoDB, Better Auth JWT verification and Stripe.",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node index.js",
+    "dev": "nodemon index.js",
+    "promote-admin": "node index.js promote-admin",
+    "check": "node --check index.js"
   },
-  "keywords": [],
+  "keywords": [
+    "stylevique",
+    "salon",
+    "express",
+    "mongodb",
+    "stripe",
+    "better-auth"
+  ],
   "author": "",
   "license": "ISC",
   "type": "module",
   "dependencies": {
-    "@better-auth/mongo-adapter": "^1.7.25",
-    "better-auth": "^1.7.25",
     "cors": "^2.8.6",
     "dotenv": "^18.0.10",
     "express": "^5.3.0",
+    "express-rate-limit": "^8.7.4",
+    "helmet": "^8.3.0",
     "jose": "^6.2.17",
     "mongodb": "^7.9.0",
-    "mongoose": "^9.12.2",
-    "stripe": "^23.1.0"
+    "multer": "^2.5.0",
+    "stripe": "^23.1.0",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.14"
   }
 }
