@@ -1,0 +1,4 @@
+npm init -y
+npm pkg set type=module
+npm install express cors dotenv mongoose mongodb better-auth @better-auth/mongo-adapter jose stripe
+npm install -D typescript tsx @types/node @types/express @types/cors
