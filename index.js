@@ -1904,9 +1904,32 @@ app.get(
     "/api/appointments/my",
     verifyToken,
     verifyCustomer,
-    validateQuery(appointmentListQuerySchema),
     async (req, res) => {
-        const { status, page, limit } = req.validatedQuery;
+        const page = Number(req.query.page || 1);
+        const limit = Number(req.query.limit || 20);
+        const status = String(req.query.status || "");
+
+        if (!Number.isInteger(page) || page < 1) {
+            return sendError(res, 422, "Invalid query parameters.", [
+                { field: "page", message: "Page must be a positive whole number." },
+            ]);
+        }
+
+        if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+            return sendError(res, 422, "Invalid query parameters.", [
+                { field: "limit", message: "Limit must be between 1 and 100." },
+            ]);
+        }
+
+        if (status && !APPOINTMENT_STATUSES.includes(status)) {
+            return sendError(res, 422, "Invalid query parameters.", [
+                {
+                    field: "status",
+                    message: "Status must be pending, confirmed or cancelled.",
+                },
+            ]);
+        }
+
         const filter = { customerId: req.user.id };
 
         if (status) {
@@ -1914,7 +1937,6 @@ app.get(
         }
 
         const skip = (page - 1) * limit;
-
         const [appointments, totalItems] = await Promise.all([
             appointmentsCollection
                 .find(filter)
@@ -1934,42 +1956,42 @@ app.get(
 
 // Get one appointment. Customers may only read their own appointment; admins
 // may read any appointment.
-app.get(
-    "/api/appointments/:id",
-    verifyToken,
-    validateObjectIdParam("id", "appointment"),
-    async (req, res) => {
-        const appointment = await appointmentsCollection.findOne({
-            _id: req.validatedObjectId,
-        });
+app.get("/api/appointments/:id", verifyToken, async (req, res) => {
+    if (!ObjectId.isValid(req.params.id)) {
+        return sendError(res, 400, "Invalid appointment ID.");
+    }
 
-        if (!appointment) {
-            return sendError(res, 404, "Appointment not found.");
-        }
+    const appointment = await appointmentsCollection.findOne({
+        _id: new ObjectId(req.params.id),
+    });
 
-        if (
-            req.user.role !== "admin" &&
-            appointment.customerId !== req.user.id
-        ) {
-            return sendError(res, 403, "You cannot view another customer's appointment.");
-        }
+    if (!appointment) {
+        return sendError(res, 404, "Appointment not found.");
+    }
 
-        return sendSuccess(res, "Appointment retrieved successfully.", {
-            appointment: normalizeAppointment(appointment),
-        });
-    },
-);
+    if (req.user.role !== "admin" && appointment.customerId !== req.user.id) {
+        return sendError(res, 403, "You cannot view another customer's appointment.");
+    }
 
-// Cancel a pending appointment (customer only). The active slot key is
-// removed atomically, which releases the time slot for someone else.
+    return sendSuccess(res, "Appointment retrieved successfully.", {
+        appointment: normalizeAppointment(appointment),
+    });
+});
+
+// Cancel a pending appointment (customer only). Removing activeSlotKey releases
+// the time slot for someone else.
 app.patch(
     "/api/appointments/:id/cancel",
     verifyToken,
     verifyCustomer,
-    validateObjectIdParam("id", "appointment"),
     async (req, res) => {
+        if (!ObjectId.isValid(req.params.id)) {
+            return sendError(res, 400, "Invalid appointment ID.");
+        }
+
+        const appointmentId = new ObjectId(req.params.id);
         const appointment = await appointmentsCollection.findOne({
-            _id: req.validatedObjectId,
+            _id: appointmentId,
         });
 
         if (!appointment) {
@@ -1997,10 +2019,9 @@ app.patch(
         }
 
         const now = new Date();
-
         const cancelledAppointment = await appointmentsCollection.findOneAndUpdate(
             {
-                _id: req.validatedObjectId,
+                _id: appointmentId,
                 customerId: req.user.id,
                 status: "pending",
             },
@@ -2011,9 +2032,7 @@ app.patch(
                     cancelledBy: req.user.id,
                     updatedAt: now,
                 },
-                $unset: {
-                    activeSlotKey: "",
-                },
+                $unset: { activeSlotKey: "" },
             },
             { returnDocument: "after" },
         );
