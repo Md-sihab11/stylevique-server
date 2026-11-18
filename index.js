@@ -1247,14 +1247,82 @@ async function respondWithServiceList(req, res, onlyActive) {
     });
 }
 
-// Public: only active services are visible.
-app.get(
-    "/api/services",
-    validateQuery(serviceListQuerySchema),
-    async (req, res) => {
-        return respondWithServiceList(req, res, true);
-    },
-);
+// Public list: customers only see active services.
+app.get("/api/services", async (req, res) => {
+    const page = Number(req.query.page || 1);
+    const limit = Number(req.query.limit || 12);
+    const search = String(req.query.search || "").trim();
+    const category = String(req.query.category || "").trim();
+    const sortName = String(req.query.sort || "newest");
+
+    if (!Number.isInteger(page) || page < 1) {
+        return sendError(res, 422, "Invalid query parameters.", [
+            { field: "page", message: "Page must be a positive whole number." },
+        ]);
+    }
+
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+        return sendError(res, 422, "Invalid query parameters.", [
+            { field: "limit", message: "Limit must be between 1 and 100." },
+        ]);
+    }
+
+    if (search.length > 100) {
+        return sendError(res, 422, "Invalid query parameters.", [
+            { field: "search", message: "Search must be 100 characters or fewer." },
+        ]);
+    }
+
+    if (category.length > 80) {
+        return sendError(res, 422, "Invalid query parameters.", [
+            { field: "category", message: "Category must be 80 characters or fewer." },
+        ]);
+    }
+
+    const sortOptions = {
+        newest: { createdAt: -1 },
+        oldest: { createdAt: 1 },
+        price_asc: { price: 1, createdAt: -1 },
+        price_desc: { price: -1, createdAt: -1 },
+    };
+
+    if (!sortOptions[sortName]) {
+        return sendError(res, 422, "Invalid query parameters.", [
+            {
+                field: "sort",
+                message: "Sort must be newest, oldest, price_asc or price_desc.",
+            },
+        ]);
+    }
+
+    // Escape search text before using it in a regular expression. Otherwise a
+    // customer could inject regex syntax into the MongoDB query.
+    const filter = { status: "active" };
+
+    if (search) {
+        filter.serviceName = { $regex: escapeRegex(search), $options: "i" };
+    }
+
+    if (category) {
+        filter.category = { $regex: `^${escapeRegex(category)}$`, $options: "i" };
+    }
+
+    const skip = (page - 1) * limit;
+    const [services, totalItems] = await Promise.all([
+        servicesCollection
+            .find(filter)
+            .sort(sortOptions[sortName])
+            .skip(skip)
+            .limit(limit)
+            .toArray(),
+        servicesCollection.countDocuments(filter),
+    ]);
+
+    return sendSuccess(res, "Services retrieved successfully.", {
+        services: services.map(normalizeService),
+        pagination: buildPagination(page, limit, totalItems),
+    });
+});
 
 // This route must be declared before /api/services/:id.
 app.get("/api/services/categories", async (req, res) => {
@@ -1262,13 +1330,9 @@ app.get("/api/services/categories", async (req, res) => {
         status: "active",
     });
 
-    return sendSuccess(
-        res,
-        "Service categories retrieved successfully.",
-        {
-            categories: categories.filter(Boolean).sort((a, b) => a.localeCompare(b)),
-        },
-    );
+    return sendSuccess(res, "Service categories retrieved successfully.", {
+        categories: categories.filter(Boolean).sort((a, b) => a.localeCompare(b)),
+    });
 });
 
 // Admin: all services, including inactive ones.
@@ -1282,26 +1346,25 @@ app.get(
     },
 );
 
-// Public service details. Inactive services are deliberately hidden from
-// customers, so they return 404 just like a missing service.
-app.get(
-    "/api/services/:id",
-    validateObjectIdParam("id", "service", 404),
-    async (req, res) => {
-        const service = await servicesCollection.findOne({
-            _id: req.validatedObjectId,
-            status: "active",
-        });
+// Public service details. Inactive services are hidden from customers.
+app.get("/api/services/:id", async (req, res) => {
+    if (!ObjectId.isValid(req.params.id)) {
+        return sendError(res, 404, "Service not found.");
+    }
 
-        if (!service) {
-            return sendError(res, 404, "Service not found.");
-        }
+    const service = await servicesCollection.findOne({
+        _id: new ObjectId(req.params.id),
+        status: "active",
+    });
 
-        return sendSuccess(res, "Service retrieved successfully.", {
-            service: normalizeService(service),
-        });
-    },
-);
+    if (!service) {
+        return sendError(res, 404, "Service not found.");
+    }
+
+    return sendSuccess(res, "Service retrieved successfully.", {
+        service: normalizeService(service),
+    });
+});
 
 // Create a service (admin only).
 app.post(
