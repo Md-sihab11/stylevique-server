@@ -1124,20 +1124,6 @@ app.post(
 // 12. SERVICE RELATED APIs
 // ========================================
 
-// A route parameter is only safe to query after it is a valid ObjectId.
-function validateObjectIdParam(paramName = "id", label = "resource", statusCode = 400) {
-    return (req, res, next) => {
-        const objectId = parseObjectId(req.params[paramName]);
-
-        if (!objectId) {
-            return sendError(res, statusCode, `Invalid ${label} ID.`);
-        }
-
-        req.validatedObjectId = objectId;
-        next();
-    };
-}
-
 // Public list: customers only see active services.
 app.get("/api/services", async (req, res) => {
     const page = Number(req.query.page || 1);
@@ -1707,24 +1693,6 @@ const APPOINTMENT_STATUSES = Object.freeze([
     "cancelled",
 ]);
 
-const ADMIN_APPOINTMENT_ACTIONS = Object.freeze(["confirmed", "cancelled"]);
-
-const appointmentListQuerySchema = z.object({
-    status: optionalEnumQuery(APPOINTMENT_STATUSES),
-    page: pageQueryField(),
-    limit: limitQueryField(20, 100),
-});
-
-const adminAppointmentListQuerySchema = appointmentListQuerySchema.extend({
-    date: optionalQueryString(10),
-});
-
-const adminAppointmentStatusSchema = z
-    .object({
-        status: z.enum(ADMIN_APPOINTMENT_ACTIONS),
-    })
-    .strict();
-
 async function attachCustomerInformation(appointments) {
     const customerIds = appointments.map((appointment) => appointment.customerId);
     const customerDocuments = await findUsersByIds(customerIds);
@@ -2058,9 +2026,38 @@ app.get(
     "/api/admin/appointments",
     verifyToken,
     verifyAdmin,
-    validateQuery(adminAppointmentListQuerySchema),
     async (req, res) => {
-        const { status, date, page, limit } = req.validatedQuery;
+        const page = Number(req.query.page || 1);
+        const limit = Number(req.query.limit || 20);
+        const status = String(req.query.status || "");
+        const date = String(req.query.date || "");
+
+        if (!Number.isInteger(page) || page < 1) {
+            return sendError(res, 422, "Invalid query parameters.", [
+                { field: "page", message: "Page must be a positive whole number." },
+            ]);
+        }
+
+        if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+            return sendError(res, 422, "Invalid query parameters.", [
+                { field: "limit", message: "Limit must be between 1 and 100." },
+            ]);
+        }
+
+        if (status && !APPOINTMENT_STATUSES.includes(status)) {
+            return sendError(res, 422, "Invalid query parameters.", [
+                {
+                    field: "status",
+                    message: "Status must be pending, confirmed or cancelled.",
+                },
+            ]);
+        }
+
+        if (date && !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+            return sendError(res, 422, "Invalid query parameters.", [
+                { field: "date", message: "Date must use the YYYY-MM-DD format." },
+            ]);
+        }
 
         const filter = {};
 
@@ -2073,7 +2070,6 @@ app.get(
         }
 
         const skip = (page - 1) * limit;
-
         const [appointments, totalItems] = await Promise.all([
             appointmentsCollection
                 .find(filter)
@@ -2099,13 +2095,34 @@ app.patch(
     "/api/admin/appointments/:id/status",
     verifyToken,
     verifyAdmin,
-    validateObjectIdParam("id", "appointment"),
-    validateBody(adminAppointmentStatusSchema),
     async (req, res) => {
-        const newStatus = req.body.status;
+        if (!ObjectId.isValid(req.params.id)) {
+            return sendError(res, 400, "Invalid appointment ID.");
+        }
 
+        const body = req.body || {};
+        const newStatus = body.status;
+
+        if (
+            Object.keys(body).length !== 1 ||
+            !["confirmed", "cancelled"].includes(newStatus)
+        ) {
+            return sendError(
+                res,
+                422,
+                "Validation failed. Please check the submitted fields.",
+                [
+                    {
+                        field: "status",
+                        message: "Send exactly one status set to confirmed or cancelled.",
+                    },
+                ],
+            );
+        }
+
+        const appointmentId = new ObjectId(req.params.id);
         const appointment = await appointmentsCollection.findOne({
-            _id: req.validatedObjectId,
+            _id: appointmentId,
         });
 
         if (!appointment) {
@@ -2117,7 +2134,6 @@ app.patch(
             confirmed: ["cancelled"],
             cancelled: [],
         };
-
         const allowedNextStatuses = allowedTransitions[appointment.status] ?? [];
 
         if (!allowedNextStatuses.includes(newStatus)) {
@@ -2149,7 +2165,7 @@ app.patch(
 
         const updatedAppointment = await appointmentsCollection.findOneAndUpdate(
             {
-                _id: req.validatedObjectId,
+                _id: appointmentId,
                 status: appointment.status, // optimistic concurrency guard
             },
             updateDocument,
@@ -2181,35 +2197,6 @@ app.patch(
 // 14. USER RELATED APIs
 // ========================================
 
-const profileUpdateSchema = z
-    .object({
-        name: z.string().trim().min(1).max(100).optional(),
-        image: z
-            .union([z.string().trim().url().max(2048), z.literal("")])
-            .optional(),
-        phone: z
-            .string()
-            .trim()
-            .max(30)
-            .refine(
-                (value) => value === "" || /^[0-9+\-()\s]+$/.test(value),
-                "Phone may only contain digits, spaces and + - ( ) characters.",
-            )
-            .optional(),
-    })
-    // .strict() is intentional: sending role, isBlocked, email or password here
-    // produces a validation error instead of silently changing privileges.
-    .strict()
-    .refine((data) => Object.keys(data).length > 0, {
-        message: "Provide at least one profile field to update.",
-    });
-
-const adminUserListQuerySchema = z.object({
-    search: optionalQueryString(100),
-    page: pageQueryField(),
-    limit: limitQueryField(20, 100),
-});
-
 // Current user's own profile.
 app.get("/api/users/me", verifyToken, async (req, res) => {
     return sendSuccess(res, "Profile retrieved successfully.", {
@@ -2218,57 +2205,142 @@ app.get("/api/users/me", verifyToken, async (req, res) => {
 });
 
 // Customers and admins may update their own safe profile fields only.
-app.patch(
-    "/api/users/me",
-    verifyToken,
-    validateBody(profileUpdateSchema),
-    async (req, res) => {
-        const updateFields = {
-            ...req.body,
-            updatedAt: new Date(),
-        };
+app.patch("/api/users/me", verifyToken, async (req, res) => {
+    const body = req.body || {};
+    const errors = [];
+    const allowedFields = ["name", "image", "phone"];
+    const updateFields = {};
 
-        const updatedUser = await usersCollection.findOneAndUpdate(
-            buildUserIdentityFilter(req.user.id),
-            { $set: updateFields },
-            { returnDocument: "after" },
-        );
-
-        if (!updatedUser) {
-            return sendError(res, 404, "Your user account could not be found.");
+    for (const field of Object.keys(body)) {
+        if (!allowedFields.includes(field)) {
+            errors.push({
+                field,
+                message:
+                    "Only name, image and phone can be updated. Role and blocked status are managed by the server.",
+            });
         }
+    }
 
-        return sendSuccess(res, "Profile updated successfully.", {
-            user: normalizeUser(updatedUser),
+    if (body.name !== undefined) {
+        const name = typeof body.name === "string" ? body.name.trim() : "";
+
+        if (name.length < 1 || name.length > 100) {
+            errors.push({
+                field: "name",
+                message: "Name must be between 1 and 100 characters.",
+            });
+        } else {
+            updateFields.name = name;
+        }
+    }
+
+    if (body.image !== undefined) {
+        const image = typeof body.image === "string" ? body.image.trim() : null;
+
+        if (image === null || (image !== "" && (!isValidUrl(image) || image.length > 2048))) {
+            errors.push({
+                field: "image",
+                message: "Image must be a valid URL or an empty string.",
+            });
+        } else {
+            updateFields.image = image;
+        }
+    }
+
+    if (body.phone !== undefined) {
+        const phone = typeof body.phone === "string" ? body.phone.trim() : null;
+
+        if (
+            phone === null ||
+            phone.length > 30 ||
+            !/^[0-9+\-()\s]*$/.test(phone)
+        ) {
+            errors.push({
+                field: "phone",
+                message:
+                    "Phone may only contain digits, spaces and + - ( ) characters.",
+            });
+        } else {
+            updateFields.phone = phone;
+        }
+    }
+
+    if (Object.keys(body).length === 0) {
+        errors.push({
+            field: "request",
+            message: "Provide at least one profile field to update.",
         });
-    },
-);
+    }
 
-// Registered customers (admin only). Admin accounts are excluded on purpose:
-// this endpoint manages customers, not administrators.
+    if (errors.length > 0) {
+        return sendError(
+            res,
+            422,
+            "Validation failed. Please check the submitted fields.",
+            errors,
+        );
+    }
+
+    const updatedUser = await usersCollection.findOneAndUpdate(
+        buildUserIdentityFilter(req.user.id),
+        {
+            $set: {
+                ...updateFields,
+                updatedAt: new Date(),
+            },
+        },
+        { returnDocument: "after" },
+    );
+
+    if (!updatedUser) {
+        return sendError(res, 404, "Your user account could not be found.");
+    }
+
+    return sendSuccess(res, "Profile updated successfully.", {
+        user: normalizeUser(updatedUser),
+    });
+});
+
+// Registered customers (admin only). Admin accounts are excluded because this
+// endpoint manages customers, not administrators.
 app.get(
     "/api/admin/users",
     verifyToken,
     verifyAdmin,
-    validateQuery(adminUserListQuerySchema),
     async (req, res) => {
-        const { search, page, limit } = req.validatedQuery;
+        const page = Number(req.query.page || 1);
+        const limit = Number(req.query.limit || 20);
+        const search = String(req.query.search || "").trim();
 
-        const filter = {
-            role: { $ne: "admin" },
-        };
+        if (!Number.isInteger(page) || page < 1) {
+            return sendError(res, 422, "Invalid query parameters.", [
+                { field: "page", message: "Page must be a positive whole number." },
+            ]);
+        }
+
+        if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+            return sendError(res, 422, "Invalid query parameters.", [
+                { field: "limit", message: "Limit must be between 1 and 100." },
+            ]);
+        }
+
+        if (search.length > 100) {
+            return sendError(res, 422, "Invalid query parameters.", [
+                { field: "search", message: "Search must be 100 characters or fewer." },
+            ]);
+        }
+
+        const filter = { role: { $ne: "admin" } };
 
         if (search) {
             const searchPattern = {
                 $regex: escapeRegex(search),
                 $options: "i",
             };
-
             filter.$or = [{ name: searchPattern }, { email: searchPattern }];
         }
 
         const skip = (page - 1) * limit;
-
         const [users, totalItems] = await Promise.all([
             usersCollection
                 .find(filter)
