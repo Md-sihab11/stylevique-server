@@ -1,7 +1,3 @@
-// ========================================
-// 1. IMPORTS
-// ========================================
-
 import express from "express";
 import cors from "cors";
 import "dotenv/config";
@@ -11,7 +7,6 @@ import { rateLimit } from "express-rate-limit";
 import { MongoClient, ObjectId } from "mongodb";
 import { createRemoteJWKSet, jwtVerify } from "jose";
 import Stripe from "stripe";
-import { z } from "zod";
 
 // ========================================
 // 2. ENVIRONMENT CONFIGURATION
@@ -118,7 +113,7 @@ const corsOptions = {
         }
 
         return callback(
-            new AppError(403, "This origin is not allowed to access the API."),
+            httpError(403, "This origin is not allowed to access the API."),
         );
     },
     methods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
@@ -259,7 +254,7 @@ async function connectToMongoDB() {
 
         // Better Auth owns the user collection. The other three collections
         // belong to this API.
-        usersCollection = database.collection(AUTH_USER);
+        usersCollection = database.collection(AUTH_USER_COLLECTION);
         servicesCollection = database.collection("services");
         appointmentsCollection = database.collection("appointments");
         transactionsCollection = database.collection("transactions");
@@ -363,16 +358,14 @@ async function ensureDatabaseIndexes() {
 // ========================================
 
 /**
- * An error that is safe to send to the client. Anything that is not an
- * AppError is treated as an internal error by the central error handler.
+ * Create an error that is safe to send to the client. The central error
+ * handler returns errors with a statusCode to the caller. Any other error is
+ * logged and returned as a generic 500 response.
  */
-class AppError extends Error {
-    constructor(statusCode, message, details = undefined) {
-        super(message);
-        this.name = "AppError";
-        this.statusCode = statusCode;
-        this.details = details;
-    }
+function httpError(statusCode, message) {
+    const error = new Error(message);
+    error.statusCode = statusCode;
+    return error;
 }
 
 function sendSuccess(res, message, data = {}, statusCode = 200) {
@@ -394,53 +387,6 @@ function sendError(res, statusCode, message, details = undefined) {
     }
 
     return res.status(statusCode).json(response);
-}
-
-function validateBody(schema) {
-    return (req, res, next) => {
-        const result = schema.safeParse(req.body ?? {});
-
-        if (!result.success) {
-            return sendError(
-                res,
-                422,
-                "Validation failed. Please check the submitted fields.",
-                formatZodIssues(result.error),
-            );
-        }
-
-        req.body = result.data;
-        next();
-    };
-}
-
-/**
- * Express 5 makes req.query read-only, so validated query data is stored on
- * req.validatedQuery instead of replacing req.query.
- */
-function validateQuery(schema) {
-    return (req, res, next) => {
-        const result = schema.safeParse(req.query ?? {});
-
-        if (!result.success) {
-            return sendError(
-                res,
-                422,
-                "Invalid query parameters.",
-                formatZodIssues(result.error),
-            );
-        }
-
-        req.validatedQuery = result.data;
-        next();
-    };
-}
-
-function formatZodIssues(error) {
-    return error.issues.map((issue) => ({
-        field: issue.path.length ? issue.path.join(".") : "request",
-        message: issue.message,
-    }));
 }
 
 // Escape user input before putting it in a MongoDB regular expression. This
@@ -708,7 +654,7 @@ function toMinorCurrencyUnits(amount, currency) {
     const numericAmount = Number(amount);
 
     if (!Number.isFinite(numericAmount) || numericAmount <= 0) {
-        throw new AppError(400, "The appointment amount is invalid.");
+        throw httpError(400, "The appointment amount is invalid.");
     }
 
     return Math.round(numericAmount * 10 ** getCurrencyDecimals(currency));
@@ -717,44 +663,6 @@ function toMinorCurrencyUnits(amount, currency) {
 function fromMinorCurrencyUnits(amount, currency) {
     return roundMoney(
         Number(amount) / 10 ** getCurrencyDecimals(currency),
-    );
-}
-
-// Shared Zod helpers for query strings.
-const emptyStringToUndefined = (value) =>
-    typeof value === "string" && value.trim() === "" ? undefined : value;
-
-function optionalQueryString(maxLength) {
-    return z.preprocess(
-        (value) =>
-            value === null || value === undefined || value === ""
-                ? undefined
-                : value,
-        z.string().trim().max(maxLength).optional(),
-    );
-}
-
-function pageQueryField() {
-    return z.preprocess(
-        (value) => (value === undefined || value === null || value === "" ? 1 : value),
-        z.coerce.number().int().min(1),
-    );
-}
-
-function limitQueryField(defaultLimit = 12, maxLimit = 100) {
-    return z.preprocess(
-        (value) =>
-            value === undefined || value === null || value === ""
-                ? defaultLimit
-                : value,
-        z.coerce.number().int().min(1).max(maxLimit),
-    );
-}
-
-function optionalEnumQuery(allowedValues) {
-    return z.preprocess(
-        emptyStringToUndefined,
-        z.enum(allowedValues).optional(),
     );
 }
 
@@ -956,7 +864,7 @@ const imageUpload = multer({
     fileFilter(req, file, callback) {
         if (!ALLOWED_IMAGE_MIME_TYPES.has(file.mimetype)) {
             return callback(
-                new AppError(
+                httpError(
                     422,
                     "Unsupported image type. Please upload a JPEG, PNG, WebP or GIF image.",
                 ),
@@ -1021,7 +929,7 @@ async function uploadImageToImgBB(file) {
         );
     } catch (error) {
         console.error("ImgBB request failed:", error.name || "NetworkError");
-        throw new AppError(
+        throw httpError(
             502,
             "The image hosting service could not be reached. Please try again.",
         );
@@ -1043,7 +951,7 @@ async function uploadImageToImgBB(file) {
             "provider code:",
             payload?.error?.code ?? payload?.status_code ?? "unknown",
         );
-        throw new AppError(
+        throw httpError(
             502,
             "The image could not be uploaded. Check the ImgBB API key or try a different image.",
         );
@@ -2514,10 +2422,6 @@ app.get(
 // 16. STRIPE CHECKOUT APIs
 // ========================================
 
-const paymentVerifyQuerySchema = z.object({
-    session_id: z.string().trim().min(5).max(255),
-});
-
 function getPaymentIntentId(checkoutSession) {
     if (typeof checkoutSession.payment_intent === "string") {
         return checkoutSession.payment_intent;
@@ -2554,7 +2458,7 @@ async function getReusableCheckoutSession(appointment, amount, currency) {
 
         if (existingSession.status === "complete") {
             if (existingSession.payment_status === "paid") {
-                throw new AppError(
+                throw httpError(
                     409,
                     "A payment session for this appointment is already complete and paid. Please wait for the payment to be verified.",
                 );
@@ -2569,7 +2473,7 @@ async function getReusableCheckoutSession(appointment, amount, currency) {
             });
 
             if (!failedTransaction) {
-                throw new AppError(
+                throw httpError(
                     409,
                     "A payment session for this appointment is still being processed. Please wait and check the payment status.",
                 );
@@ -2580,7 +2484,7 @@ async function getReusableCheckoutSession(appointment, amount, currency) {
 
         return null;
     } catch (error) {
-        if (error instanceof AppError) {
+        if (error?.statusCode) {
             throw error;
         }
 
@@ -2720,14 +2624,14 @@ app.post(
                 "Stripe Checkout Session creation failed:",
                 error?.type || error?.name || "UnknownError",
             );
-            throw new AppError(
+            throw httpError(
                 502,
                 "The payment session could not be created. Please try again.",
             );
         }
 
         if (!checkoutSession.url) {
-            throw new AppError(
+            throw httpError(
                 502,
                 "Stripe did not return a checkout URL. Please try again.",
             );
@@ -2772,15 +2676,26 @@ app.post(
     },
 );
 
-// Read-only payment verification. This endpoint reports what the verified
+// Read-only payment verification. This endpoint reports only what a verified
 // webhook has already stored. It never marks an appointment as paid.
 app.get(
     "/api/payments/verify",
     verifyToken,
     verifyCustomer,
-    validateQuery(paymentVerifyQuerySchema),
     async (req, res) => {
-        const sessionId = req.validatedQuery.session_id;
+        const sessionId =
+            typeof req.query.session_id === "string"
+                ? req.query.session_id.trim()
+                : "";
+
+        if (sessionId.length < 5 || sessionId.length > 255) {
+            return sendError(res, 422, "Invalid query parameters.", [
+                {
+                    field: "session_id",
+                    message: "A valid session_id is required.",
+                },
+            ]);
+        }
 
         let appointment = await appointmentsCollection.findOne({
             checkoutSessionId: sessionId,
@@ -2816,9 +2731,8 @@ app.get(
 
         let paymentState = "pending";
 
-        // The status must belong to THIS Checkout Session. An appointment could
-        // have a failed session and a later successful one, so a globally paid
-        // appointment must not make an old failed session look successful.
+        // The transaction must belong to THIS session. A customer may have an
+        // older failed session and a newer paid one for the same appointment.
         if (transaction?.status === "paid") {
             paymentState = "paid";
         } else if (transaction?.status === "failed") {
@@ -2827,9 +2741,6 @@ app.get(
             appointment.paymentStatus === "paid" &&
             appointment.checkoutSessionId === sessionId
         ) {
-            // Defensive fallback for a completed payment whose transaction row is
-            // temporarily unavailable. The webhook has already marked the session
-            // appointment as paid.
             paymentState = "paid";
         }
 
@@ -2868,13 +2779,15 @@ function isTransactionUnsupportedError(error) {
     );
 }
 
+// Check that the signed Stripe event belongs to this application and that the
+// appointment, customer, service, currency and amount all match the database.
 async function getVerifiedCheckoutContext(checkoutSession) {
     const appointmentId = checkoutSession.metadata?.appointmentId;
     const customerId = checkoutSession.metadata?.customerId;
     const serviceId = checkoutSession.metadata?.serviceId;
 
-    // Sessions without our metadata were not created by this application.
-    // Acknowledge them without changing any data.
+    // A session without our metadata was not created by this API. Acknowledge
+    // the event without changing any data.
     if (!appointmentId || !customerId) {
         return null;
     }
@@ -2882,7 +2795,7 @@ async function getVerifiedCheckoutContext(checkoutSession) {
     const appointmentObjectId = parseObjectId(appointmentId);
 
     if (!appointmentObjectId) {
-        throw new AppError(400, "Stripe metadata contains an invalid appointment ID.");
+        throw httpError(400, "Stripe metadata contains an invalid appointment ID.");
     }
 
     const appointment = await appointmentsCollection.findOne({
@@ -2895,14 +2808,14 @@ async function getVerifiedCheckoutContext(checkoutSession) {
     }
 
     if (appointment.customerId !== customerId) {
-        throw new AppError(
+        throw httpError(
             400,
             "Stripe metadata customer does not match the appointment owner.",
         );
     }
 
     if (serviceId && String(appointment.serviceId) !== String(serviceId)) {
-        throw new AppError(
+        throw httpError(
             400,
             "Stripe metadata service does not match the appointment service.",
         );
@@ -2911,7 +2824,10 @@ async function getVerifiedCheckoutContext(checkoutSession) {
     const sessionCurrency = String(checkoutSession.currency || "").toLowerCase();
 
     if (sessionCurrency !== STRIPE_CURRENCY) {
-        throw new AppError(400, "Stripe payment currency does not match the configured currency.");
+        throw httpError(
+            400,
+            "Stripe payment currency does not match the configured currency.",
+        );
     }
 
     const expectedAmount = toMinorCurrencyUnits(
@@ -2920,24 +2836,19 @@ async function getVerifiedCheckoutContext(checkoutSession) {
     );
 
     if (checkoutSession.amount_total !== expectedAmount) {
-        throw new AppError(
+        throw httpError(
             400,
             "Stripe payment amount does not match the appointment price.",
         );
     }
 
-    return { appointment, customerId };
+    return appointment;
 }
 
-/**
- * Atomically record a verified successful payment.
- *
- * If the MongoDB deployment supports transactions (Atlas does), the
- * appointment update and transaction insert commit together. On a standalone
- * local MongoDB we fall back to sequential writes; the appointment is updated
- * first, so a retry can repair a missing transaction.
- */
-async function recordSuccessfulPayment({ appointment, checkoutSession, event }) {
+// Save the appointment payment and its transaction together. Atlas supports
+// multi-document transactions; a standalone local MongoDB uses sequential
+// writes instead.
+async function recordSuccessfulPayment(appointment, checkoutSession, event) {
     const existingPaidTransaction = await transactionsCollection.findOne({
         stripeSessionId: checkoutSession.id,
         status: "paid",
@@ -2949,35 +2860,13 @@ async function recordSuccessfulPayment({ appointment, checkoutSession, event }) 
 
     const now = new Date();
     const paymentIntentId = getPaymentIntentId(checkoutSession);
-    const transactionDocument = {
-        appointmentId: appointment._id,
-        customerId: appointment.customerId,
-        amount: appointment.servicePrice,
-        currency: STRIPE_CURRENCY,
-        stripeSessionId: checkoutSession.id,
-        stripeEventId: event.id,
-        paymentIntentId,
-        status: "paid",
-        eventType: event.type,
-        createdAt: now,
-        updatedAt: now,
-    };
 
     const applyWrites = async (mongoSessionForWrites) => {
         const options = mongoSessionForWrites
             ? { session: mongoSessionForWrites }
             : {};
 
-        const existingTransaction = await transactionsCollection.findOne(
-            { stripeSessionId: checkoutSession.id },
-            options,
-        );
-
-        if (existingTransaction?.status === "paid") {
-            return { alreadyProcessed: true };
-        }
-
-        const appointmentUpdate = await appointmentsCollection.updateOne(
+        await appointmentsCollection.updateOne(
             { _id: appointment._id },
             {
                 $set: {
@@ -2986,65 +2875,56 @@ async function recordSuccessfulPayment({ appointment, checkoutSession, event }) 
                     updatedAt: now,
                     stripePaymentIntentId: paymentIntentId,
                     checkoutSessionId: checkoutSession.id,
-                    checkoutSessionUrl: checkoutSession.url || appointment.checkoutSessionUrl || null,
+                    checkoutSessionUrl:
+                        checkoutSession.url || appointment.checkoutSessionUrl || null,
                     lastCheckoutStatus: "paid",
                 },
             },
             options,
         );
 
-        if (appointmentUpdate.matchedCount === 0) {
-            throw new AppError(409, "The appointment no longer exists.");
-        }
-
-        if (existingTransaction) {
-            // A previous async failure may already have a transaction row. Promote
-            // that same Stripe session to paid instead of creating a duplicate.
-            await transactionsCollection.updateOne(
-                { _id: existingTransaction._id },
-                {
-                    $set: {
-                        status: "paid",
-                        stripeEventId: event.id,
-                        paymentIntentId,
-                        amount: appointment.servicePrice,
-                        currency: STRIPE_CURRENCY,
-                        eventType: event.type,
-                        updatedAt: now,
-                    },
-                    $unset: {
-                        failureReason: "",
-                    },
+        await transactionsCollection.updateOne(
+            { stripeSessionId: checkoutSession.id },
+            {
+                $set: {
+                    appointmentId: appointment._id,
+                    customerId: appointment.customerId,
+                    amount: appointment.servicePrice,
+                    currency: STRIPE_CURRENCY,
+                    stripeSessionId: checkoutSession.id,
+                    stripeEventId: event.id,
+                    paymentIntentId,
+                    status: "paid",
+                    eventType: event.type,
+                    updatedAt: now,
                 },
-                options,
-            );
-        } else {
-            await transactionsCollection.insertOne(transactionDocument, options);
-        }
-
-        return { alreadyProcessed: false };
+                $setOnInsert: { createdAt: now },
+            },
+            { ...options, upsert: true },
+        );
     };
 
     if (!supportsTransactions) {
-        return applyWrites(null);
+        await applyWrites(null);
+        return { alreadyProcessed: false };
     }
 
     const mongoSession = mongoClient.startSession();
-    let transactionResult;
 
     try {
         await mongoSession.withTransaction(async () => {
-            transactionResult = await applyWrites(mongoSession);
+            await applyWrites(mongoSession);
         });
 
-        return transactionResult;
+        return { alreadyProcessed: false };
     } catch (error) {
         if (isTransactionUnsupportedError(error)) {
             supportsTransactions = false;
             console.warn(
                 "MongoDB transactions are not supported by this deployment. Falling back to sequential writes.",
             );
-            return applyWrites(null);
+            await applyWrites(null);
+            return { alreadyProcessed: false };
         }
 
         if (error?.code === 11000) {
@@ -3064,21 +2944,6 @@ async function recordSuccessfulPayment({ appointment, checkoutSession, event }) 
     }
 }
 
-async function markAppointmentPaymentState(checkoutSession, checkoutState) {
-    await appointmentsCollection.updateOne(
-        {
-            checkoutSessionId: checkoutSession.id,
-            paymentStatus: { $ne: "paid" },
-        },
-        {
-            $set: {
-                lastCheckoutStatus: checkoutState,
-                updatedAt: new Date(),
-            },
-        },
-    );
-}
-
 async function handleSuccessfulCheckoutEvent(event) {
     const checkoutSession = event.data.object;
 
@@ -3087,11 +2952,19 @@ async function handleSuccessfulCheckoutEvent(event) {
     }
 
     if (checkoutSession.payment_status !== "paid") {
-        // Some asynchronous payment methods complete the Checkout Session before
-        // the money has actually arrived. Wait for async_payment_succeeded.
-        await markAppointmentPaymentState(
-            checkoutSession,
-            "complete_pending_payment",
+        // Some asynchronous payment methods complete the Checkout Session
+        // before the money arrives. Wait for async_payment_succeeded.
+        await appointmentsCollection.updateOne(
+            {
+                checkoutSessionId: checkoutSession.id,
+                paymentStatus: { $ne: "paid" },
+            },
+            {
+                $set: {
+                    lastCheckoutStatus: "complete_pending_payment",
+                    updatedAt: new Date(),
+                },
+            },
         );
         return { ignored: true };
     }
@@ -3100,31 +2973,27 @@ async function handleSuccessfulCheckoutEvent(event) {
         return { ignored: true };
     }
 
-    const context = await getVerifiedCheckoutContext(checkoutSession);
+    const appointment = await getVerifiedCheckoutContext(checkoutSession);
 
-    if (!context) {
+    if (!appointment) {
         return { ignored: true };
     }
 
-    return recordSuccessfulPayment({
-        appointment: context.appointment,
-        checkoutSession,
-        event,
-    });
+    return recordSuccessfulPayment(appointment, checkoutSession, event);
 }
 
 async function handleFailedCheckoutEvent(event) {
     const checkoutSession = event.data.object;
 
-    // A "failed" event must never create a failed transaction for a session
-    // that Stripe currently considers paid.
+    // A failure event must never overwrite a session Stripe currently reports
+    // as paid.
     if (checkoutSession.payment_status === "paid") {
         return { ignored: true };
     }
 
-    const context = await getVerifiedCheckoutContext(checkoutSession);
+    const appointment = await getVerifiedCheckoutContext(checkoutSession);
 
-    if (!context) {
+    if (!appointment) {
         return { ignored: true };
     }
 
@@ -3146,13 +3015,14 @@ async function handleFailedCheckoutEvent(event) {
                 $set: {
                     stripeEventId: event.id,
                     status: "failed",
-                    failureReason: "Stripe reported that the asynchronous payment failed.",
+                    failureReason:
+                        "Stripe reported that the asynchronous payment failed.",
                     updatedAt: now,
                 },
                 $setOnInsert: {
-                    appointmentId: context.appointment._id,
-                    customerId: context.appointment.customerId,
-                    amount: context.appointment.servicePrice,
+                    appointmentId: appointment._id,
+                    customerId: appointment.customerId,
+                    amount: appointment.servicePrice,
                     currency: STRIPE_CURRENCY,
                     stripeSessionId: checkoutSession.id,
                     paymentIntentId: getPaymentIntentId(checkoutSession),
@@ -3162,16 +3032,16 @@ async function handleFailedCheckoutEvent(event) {
             { upsert: true },
         );
     } catch (error) {
-        // A duplicate event/session means another delivery already recorded it.
+        // A duplicate event means this failure was already recorded.
         if (error?.code !== 11000) {
             throw error;
         }
     }
 
-    // The appointment remains unpaid. A failed payment must never mark it paid.
+    // A failed payment leaves paymentStatus as "unpaid".
     await appointmentsCollection.updateOne(
         {
-            _id: context.appointment._id,
+            _id: appointment._id,
             paymentStatus: { $ne: "paid" },
         },
         {
@@ -3188,16 +3058,16 @@ async function handleFailedCheckoutEvent(event) {
 
 async function handleExpiredCheckoutEvent(event) {
     const checkoutSession = event.data.object;
-    const context = await getVerifiedCheckoutContext(checkoutSession);
+    const appointment = await getVerifiedCheckoutContext(checkoutSession);
 
-    if (!context) {
+    if (!appointment) {
         return { ignored: true };
     }
 
     // Expiration never changes paymentStatus. A paid appointment stays paid.
     await appointmentsCollection.updateOne(
         {
-            _id: context.appointment._id,
+            _id: appointment._id,
             paymentStatus: { $ne: "paid" },
         },
         {
@@ -3260,7 +3130,7 @@ async function stripeWebhookHandler(req, res) {
             STRIPE_WEBHOOK_SECRET,
         );
     } catch {
-        // Never log the signature or raw body.
+        // Never log the signature or raw request body.
         console.warn("Stripe webhook signature verification failed.");
         return sendError(res, 400, "Invalid Stripe webhook signature.");
     }
@@ -3279,7 +3149,7 @@ async function stripeWebhookHandler(req, res) {
             },
         });
     } catch (error) {
-        if (error instanceof AppError) {
+        if (error?.statusCode) {
             console.error(
                 `Stripe webhook "${event.type}" rejected:`,
                 error.message,
@@ -3291,7 +3161,6 @@ async function stripeWebhookHandler(req, res) {
             "Stripe webhook processing failed:",
             error?.code || error?.name || "UnknownError",
         );
-
         return sendError(res, 500, "Stripe webhook processing failed.");
     }
 }
@@ -3299,12 +3168,6 @@ async function stripeWebhookHandler(req, res) {
 // ========================================
 // 18. TRANSACTION APIS
 // ========================================
-
-const transactionListQuerySchema = z.object({
-    status: optionalEnumQuery(["paid", "failed"]),
-    page: pageQueryField(),
-    limit: limitQueryField(20, 100),
-});
 
 /**
  * Add appointment/service data (and optionally customer data) to transaction
@@ -3361,7 +3224,27 @@ async function attachTransactionDetails(transactions, includeCustomer) {
 }
 
 async function respondWithTransactions(req, res, includeCustomer) {
-    const { status, page, limit } = req.validatedQuery;
+    const page = Number(req.query.page || 1);
+    const limit = Number(req.query.limit || 20);
+    const status = String(req.query.status || "");
+
+    if (!Number.isInteger(page) || page < 1) {
+        return sendError(res, 422, "Invalid query parameters.", [
+            { field: "page", message: "Page must be a positive whole number." },
+        ]);
+    }
+
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+        return sendError(res, 422, "Invalid query parameters.", [
+            { field: "limit", message: "Limit must be between 1 and 100." },
+        ]);
+    }
+
+    if (status && !["paid", "failed"].includes(status)) {
+        return sendError(res, 422, "Invalid query parameters.", [
+            { field: "status", message: "Status must be paid or failed." },
+        ]);
+    }
 
     const filter = includeCustomer
         ? {}
@@ -3399,7 +3282,6 @@ app.get(
     "/api/transactions/my",
     verifyToken,
     verifyCustomer,
-    validateQuery(transactionListQuerySchema),
     async (req, res) => {
         return respondWithTransactions(req, res, false);
     },
@@ -3411,7 +3293,6 @@ app.get(
     "/api/admin/transactions",
     verifyToken,
     verifyAdmin,
-    validateQuery(transactionListQuerySchema),
     async (req, res) => {
         return respondWithTransactions(req, res, true);
     },
@@ -3443,14 +3324,10 @@ function errorHandler(error, req, res, next) {
     let message = "An unexpected internal server error occurred.";
     let details;
 
-    if (error instanceof AppError) {
+    if (error?.statusCode) {
         statusCode = error.statusCode;
         message = error.message;
         details = error.details;
-    } else if (error instanceof z.ZodError) {
-        statusCode = 422;
-        message = "Validation failed.";
-        details = formatZodIssues(error);
     } else if (error instanceof multer.MulterError) {
         if (error.code === "LIMIT_FILE_SIZE") {
             statusCode = 413;
