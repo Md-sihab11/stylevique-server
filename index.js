@@ -907,9 +907,14 @@ async function verifyToken(req, res, next) {
 // 10. ROLE VERIFICATION MIDDLEWARE
 // ========================================
 
+// Only customers may book appointments and manage their own bookings.
 function verifyCustomer(req, res, next) {
     if (!req.user) {
         return sendError(res, 401, "Authentication required.");
+    }
+
+    if (req.user.isBlocked) {
+        return sendError(res, 403, "Your account has been blocked.");
     }
 
     if (req.user.role !== "customer") {
@@ -923,9 +928,14 @@ function verifyCustomer(req, res, next) {
     next();
 }
 
+// Only administrators may manage services, users, appointments and payments.
 function verifyAdmin(req, res, next) {
     if (!req.user) {
         return sendError(res, 401, "Authentication required.");
+    }
+
+    if (req.user.isBlocked) {
+        return sendError(res, 403, "Your account has been blocked.");
     }
 
     if (req.user.role !== "admin") {
