@@ -449,6 +449,15 @@ function escapeRegex(value) {
     return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+function isValidUrl(value) {
+    try {
+        new URL(value);
+        return true;
+    } catch {
+        return false;
+    }
+}
+
 function parseObjectId(value) {
     if (typeof value !== "string" || !/^[a-fA-F0-9]{24}$/.test(value)) {
         return null;
@@ -1070,32 +1079,27 @@ app.post(
     "/api/uploads/image",
     uploadLimiter,
     verifyToken,
-    (req, res, next) => {
-        imageUpload.single("image")(req, res, (error) => {
-            if (error) {
-                return next(error);
-            }
-
-            next();
-        });
-    },
+    imageUpload.single("image"),
     async (req, res) => {
         if (!IMGBB_API_KEY) {
-            throw new AppError(
+            return sendError(
+                res,
                 503,
                 "Image uploads are not configured yet. Add IMGBB_API_KEY on the server.",
             );
         }
 
         if (!req.file) {
-            throw new AppError(
+            return sendError(
+                res,
                 400,
                 "No image was supplied. Upload it as multipart/form-data using the field name \"image\".",
             );
         }
 
         if (!hasValidImageSignature(req.file.buffer, req.file.mimetype)) {
-            throw new AppError(
+            return sendError(
+                res,
                 422,
                 "The uploaded file does not look like a valid image.",
             );
@@ -1120,58 +1124,7 @@ app.post(
 // 12. SERVICE RELATED APIs
 // ========================================
 
-const SERVICE_STATUSES = Object.freeze(["active", "inactive"]);
-const SERVICE_SORT_OPTIONS = Object.freeze([
-    "newest",
-    "oldest",
-    "price_asc",
-    "price_desc",
-]);
-
-const serviceCreateSchema = z
-    .object({
-        serviceName: z.string().trim().min(2).max(120),
-        category: z.string().trim().min(2).max(80),
-        description: z.string().trim().min(10).max(2000),
-        price: z.coerce.number().positive().max(1000000),
-        duration: z.coerce.number().int().positive().max(1440),
-        image: z.string().trim().url().max(2048),
-        status: z.enum(SERVICE_STATUSES).optional().default("active"),
-    })
-    .strict();
-
-const serviceUpdateSchema = z
-    .object({
-        serviceName: z.string().trim().min(2).max(120).optional(),
-        category: z.string().trim().min(2).max(80).optional(),
-        description: z.string().trim().min(10).max(2000).optional(),
-        price: z.coerce.number().positive().max(1000000).optional(),
-        duration: z.coerce.number().int().positive().max(1440).optional(),
-        image: z.string().trim().url().max(2048).optional(),
-    })
-    .strict()
-    .refine((data) => Object.keys(data).length > 0, {
-        message: "Provide at least one field to update.",
-    });
-
-const serviceStatusSchema = z
-    .object({
-        status: z.enum(SERVICE_STATUSES),
-    })
-    .strict();
-
-const serviceListQuerySchema = z.object({
-    search: optionalQueryString(100),
-    category: optionalQueryString(80),
-    sort: optionalEnumQuery(SERVICE_SORT_OPTIONS),
-    page: pageQueryField(),
-    limit: limitQueryField(12, 100),
-});
-
-const adminServiceListQuerySchema = serviceListQuerySchema.extend({
-    status: optionalEnumQuery(SERVICE_STATUSES),
-});
-
+// A route parameter is only safe to query after it is a valid ObjectId.
 function validateObjectIdParam(paramName = "id", label = "resource", statusCode = 400) {
     return (req, res, next) => {
         const objectId = parseObjectId(req.params[paramName]);
@@ -1183,68 +1136,6 @@ function validateObjectIdParam(paramName = "id", label = "resource", statusCode 
         req.validatedObjectId = objectId;
         next();
     };
-}
-
-function buildServiceFilter(query, onlyActive) {
-    const filter = {};
-
-    if (onlyActive) {
-        filter.status = "active";
-    } else if (query.status) {
-        filter.status = query.status;
-    }
-
-    if (query.search) {
-        filter.serviceName = {
-            $regex: escapeRegex(query.search),
-            $options: "i",
-        };
-    }
-
-    if (query.category) {
-        filter.category = {
-            $regex: `^${escapeRegex(query.category)}$`,
-            $options: "i",
-        };
-    }
-
-    return filter;
-}
-
-function getServiceSort(sortOption) {
-    switch (sortOption) {
-        case "price_asc":
-            return { price: 1, createdAt: -1 };
-        case "price_desc":
-            return { price: -1, createdAt: -1 };
-        case "oldest":
-            return { createdAt: 1 };
-        case "newest":
-        default:
-            return { createdAt: -1 };
-    }
-}
-
-async function respondWithServiceList(req, res, onlyActive) {
-    const { search, category, sort, page, limit, status } = req.validatedQuery;
-
-    const filter = buildServiceFilter({ search, category, status }, onlyActive);
-    const skip = (page - 1) * limit;
-
-    const [services, totalItems] = await Promise.all([
-        servicesCollection
-            .find(filter)
-            .sort(getServiceSort(sort))
-            .skip(skip)
-            .limit(limit)
-            .toArray(),
-        servicesCollection.countDocuments(filter),
-    ]);
-
-    return sendSuccess(res, "Services retrieved successfully.", {
-        services: services.map(normalizeService),
-        pagination: buildPagination(page, limit, totalItems),
-    });
 }
 
 // Public list: customers only see active services.
@@ -1340,9 +1231,89 @@ app.get(
     "/api/admin/services",
     verifyToken,
     verifyAdmin,
-    validateQuery(adminServiceListQuerySchema),
     async (req, res) => {
-        return respondWithServiceList(req, res, false);
+        const page = Number(req.query.page || 1);
+        const limit = Number(req.query.limit || 12);
+        const search = String(req.query.search || "").trim();
+        const category = String(req.query.category || "").trim();
+        const status = String(req.query.status || "");
+        const sortName = String(req.query.sort || "newest");
+
+        if (!Number.isInteger(page) || page < 1) {
+            return sendError(res, 422, "Invalid query parameters.", [
+                { field: "page", message: "Page must be a positive whole number." },
+            ]);
+        }
+
+        if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+            return sendError(res, 422, "Invalid query parameters.", [
+                { field: "limit", message: "Limit must be between 1 and 100." },
+            ]);
+        }
+
+        if (search.length > 100) {
+            return sendError(res, 422, "Invalid query parameters.", [
+                { field: "search", message: "Search must be 100 characters or fewer." },
+            ]);
+        }
+
+        if (category.length > 80) {
+            return sendError(res, 422, "Invalid query parameters.", [
+                { field: "category", message: "Category must be 80 characters or fewer." },
+            ]);
+        }
+
+        if (status && !["active", "inactive"].includes(status)) {
+            return sendError(res, 422, "Invalid query parameters.", [
+                { field: "status", message: "Status must be active or inactive." },
+            ]);
+        }
+
+        const sortOptions = {
+            newest: { createdAt: -1 },
+            oldest: { createdAt: 1 },
+            price_asc: { price: 1, createdAt: -1 },
+            price_desc: { price: -1, createdAt: -1 },
+        };
+
+        if (!sortOptions[sortName]) {
+            return sendError(res, 422, "Invalid query parameters.", [
+                {
+                    field: "sort",
+                    message: "Sort must be newest, oldest, price_asc or price_desc.",
+                },
+            ]);
+        }
+
+        const filter = {};
+
+        if (status) {
+            filter.status = status;
+        }
+
+        if (search) {
+            filter.serviceName = { $regex: escapeRegex(search), $options: "i" };
+        }
+
+        if (category) {
+            filter.category = { $regex: `^${escapeRegex(category)}$`, $options: "i" };
+        }
+
+        const skip = (page - 1) * limit;
+        const [services, totalItems] = await Promise.all([
+            servicesCollection
+                .find(filter)
+                .sort(sortOptions[sortName])
+                .skip(skip)
+                .limit(limit)
+                .toArray(),
+            servicesCollection.countDocuments(filter),
+        ]);
+
+        return sendSuccess(res, "Services retrieved successfully.", {
+            services: services.map(normalizeService),
+            pagination: buildPagination(page, limit, totalItems),
+        });
     },
 );
 
@@ -1367,59 +1338,248 @@ app.get("/api/services/:id", async (req, res) => {
 });
 
 // Create a service (admin only).
-app.post(
-    "/api/services",
-    verifyToken,
-    verifyAdmin,
-    validateBody(serviceCreateSchema),
-    async (req, res) => {
-        const now = new Date();
+app.post("/api/services", verifyToken, verifyAdmin, async (req, res) => {
+    const body = req.body || {};
+    const errors = [];
+    const allowedFields = [
+        "serviceName",
+        "category",
+        "description",
+        "price",
+        "duration",
+        "image",
+        "status",
+    ];
 
-        const serviceDocument = {
-            serviceName: req.body.serviceName,
-            category: req.body.category,
-            description: req.body.description,
-            price: roundMoney(req.body.price),
-            duration: req.body.duration,
-            image: req.body.image,
-            status: req.body.status,
-            createdAt: now,
-            updatedAt: now,
-        };
+    for (const field of Object.keys(body)) {
+        if (!allowedFields.includes(field)) {
+            errors.push({ field, message: "This field is not allowed." });
+        }
+    }
 
-        const result = await servicesCollection.insertOne(serviceDocument);
+    const serviceName = typeof body.serviceName === "string" ? body.serviceName.trim() : "";
+    const category = typeof body.category === "string" ? body.category.trim() : "";
+    const description =
+        typeof body.description === "string" ? body.description.trim() : "";
+    const image = typeof body.image === "string" ? body.image.trim() : "";
+    const price = Number(body.price);
+    const duration = Number(body.duration);
+    const status = body.status === undefined ? "active" : body.status;
 
-        return sendSuccess(
+    if (serviceName.length < 2 || serviceName.length > 120) {
+        errors.push({
+            field: "serviceName",
+            message: "Service name must be between 2 and 120 characters.",
+        });
+    }
+
+    if (category.length < 2 || category.length > 80) {
+        errors.push({
+            field: "category",
+            message: "Category must be between 2 and 80 characters.",
+        });
+    }
+
+    if (description.length < 10 || description.length > 2000) {
+        errors.push({
+            field: "description",
+            message: "Description must be between 10 and 2000 characters.",
+        });
+    }
+
+    if (!Number.isFinite(price) || price <= 0 || price > 1000000) {
+        errors.push({
+            field: "price",
+            message: "Price must be greater than 0 and at most 1000000.",
+        });
+    }
+
+    if (!Number.isInteger(duration) || duration <= 0 || duration > 1440) {
+        errors.push({
+            field: "duration",
+            message: "Duration must be a whole number between 1 and 1440 minutes.",
+        });
+    }
+
+    if (!isValidUrl(image) || image.length > 2048) {
+        errors.push({ field: "image", message: "Image must be a valid URL." });
+    }
+
+    if (!["active", "inactive"].includes(status)) {
+        errors.push({
+            field: "status",
+            message: "Status must be active or inactive.",
+        });
+    }
+
+    if (errors.length > 0) {
+        return sendError(
             res,
-            "Service created successfully.",
-            {
-                service: normalizeService({
-                    ...serviceDocument,
-                    _id: result.insertedId,
-                }),
-            },
-            201,
+            422,
+            "Validation failed. Please check the submitted fields.",
+            errors,
         );
-    },
-);
+    }
 
-// Update service information (admin only). Historical appointment snapshots
-// are stored separately, so editing a service does not rewrite old bookings.
+    const now = new Date();
+    const serviceDocument = {
+        serviceName,
+        category,
+        description,
+        price: roundMoney(price),
+        duration,
+        image,
+        status,
+        createdAt: now,
+        updatedAt: now,
+    };
+
+    const result = await servicesCollection.insertOne(serviceDocument);
+
+    return sendSuccess(
+        res,
+        "Service created successfully.",
+        {
+            service: normalizeService({
+                ...serviceDocument,
+                _id: result.insertedId,
+            }),
+        },
+        201,
+    );
+});
+
+// Update service information (admin only). Historic appointment snapshots are
+// stored separately, so old bookings keep their original details.
 app.patch(
     "/api/services/:id",
     verifyToken,
     verifyAdmin,
-    validateObjectIdParam("id", "service"),
-    validateBody(serviceUpdateSchema),
     async (req, res) => {
-        const updateFields = { ...req.body };
+        if (!ObjectId.isValid(req.params.id)) {
+            return sendError(res, 400, "Invalid service ID.");
+        }
 
-        if (updateFields.price !== undefined) {
-            updateFields.price = roundMoney(updateFields.price);
+        const body = req.body || {};
+        const errors = [];
+        const allowedFields = [
+            "serviceName",
+            "category",
+            "description",
+            "price",
+            "duration",
+            "image",
+        ];
+        const updateFields = {};
+
+        for (const field of Object.keys(body)) {
+            if (!allowedFields.includes(field)) {
+                errors.push({
+                    field,
+                    message:
+                        field === "status"
+                            ? "Use PATCH /api/services/:id/status to change status."
+                            : "This field is not allowed.",
+                });
+            }
+        }
+
+        if (body.serviceName !== undefined) {
+            const serviceName =
+                typeof body.serviceName === "string" ? body.serviceName.trim() : "";
+
+            if (serviceName.length < 2 || serviceName.length > 120) {
+                errors.push({
+                    field: "serviceName",
+                    message: "Service name must be between 2 and 120 characters.",
+                });
+            } else {
+                updateFields.serviceName = serviceName;
+            }
+        }
+
+        if (body.category !== undefined) {
+            const category =
+                typeof body.category === "string" ? body.category.trim() : "";
+
+            if (category.length < 2 || category.length > 80) {
+                errors.push({
+                    field: "category",
+                    message: "Category must be between 2 and 80 characters.",
+                });
+            } else {
+                updateFields.category = category;
+            }
+        }
+
+        if (body.description !== undefined) {
+            const description =
+                typeof body.description === "string" ? body.description.trim() : "";
+
+            if (description.length < 10 || description.length > 2000) {
+                errors.push({
+                    field: "description",
+                    message: "Description must be between 10 and 2000 characters.",
+                });
+            } else {
+                updateFields.description = description;
+            }
+        }
+
+        if (body.price !== undefined) {
+            const price = Number(body.price);
+
+            if (!Number.isFinite(price) || price <= 0 || price > 1000000) {
+                errors.push({
+                    field: "price",
+                    message: "Price must be greater than 0 and at most 1000000.",
+                });
+            } else {
+                updateFields.price = roundMoney(price);
+            }
+        }
+
+        if (body.duration !== undefined) {
+            const duration = Number(body.duration);
+
+            if (!Number.isInteger(duration) || duration <= 0 || duration > 1440) {
+                errors.push({
+                    field: "duration",
+                    message: "Duration must be a whole number between 1 and 1440 minutes.",
+                });
+            } else {
+                updateFields.duration = duration;
+            }
+        }
+
+        if (body.image !== undefined) {
+            const image = typeof body.image === "string" ? body.image.trim() : "";
+
+            if (!isValidUrl(image) || image.length > 2048) {
+                errors.push({ field: "image", message: "Image must be a valid URL." });
+            } else {
+                updateFields.image = image;
+            }
+        }
+
+        if (Object.keys(body).length === 0) {
+            errors.push({
+                field: "request",
+                message: "Provide at least one field to update.",
+            });
+        }
+
+        if (errors.length > 0) {
+            return sendError(
+                res,
+                422,
+                "Validation failed. Please check the submitted fields.",
+                errors,
+            );
         }
 
         const updatedService = await servicesCollection.findOneAndUpdate(
-            { _id: req.validatedObjectId },
+            { _id: new ObjectId(req.params.id) },
             {
                 $set: {
                     ...updateFields,
@@ -1444,14 +1604,36 @@ app.patch(
     "/api/services/:id/status",
     verifyToken,
     verifyAdmin,
-    validateObjectIdParam("id", "service"),
-    validateBody(serviceStatusSchema),
     async (req, res) => {
+        if (!ObjectId.isValid(req.params.id)) {
+            return sendError(res, 400, "Invalid service ID.");
+        }
+
+        const body = req.body || {};
+        const status = body.status;
+
+        if (
+            Object.keys(body).length !== 1 ||
+            !["active", "inactive"].includes(status)
+        ) {
+            return sendError(
+                res,
+                422,
+                "Validation failed. Please check the submitted fields.",
+                [
+                    {
+                        field: "status",
+                        message: "Send exactly one status field set to active or inactive.",
+                    },
+                ],
+            );
+        }
+
         const updatedService = await servicesCollection.findOneAndUpdate(
-            { _id: req.validatedObjectId },
+            { _id: new ObjectId(req.params.id) },
             {
                 $set: {
-                    status: req.body.status,
+                    status,
                     updatedAt: new Date(),
                 },
             },
@@ -1464,33 +1646,31 @@ app.patch(
 
         return sendSuccess(
             res,
-            `Service ${req.body.status === "active" ? "activated" : "deactivated"} successfully.`,
+            `Service ${status === "active" ? "activated" : "deactivated"} successfully.`,
             { service: normalizeService(updatedService) },
         );
     },
 );
 
-// Delete a service (admin only). Appointments keep their serviceSnapshot, so
+// Delete a service (admin only). Appointments keep their snapshot, so
 // historical information is still available after deletion.
-app.delete(
-    "/api/services/:id",
-    verifyToken,
-    verifyAdmin,
-    validateObjectIdParam("id", "service"),
-    async (req, res) => {
-        const deletedService = await servicesCollection.findOneAndDelete({
-            _id: req.validatedObjectId,
-        });
+app.delete("/api/services/:id", verifyToken, verifyAdmin, async (req, res) => {
+    if (!ObjectId.isValid(req.params.id)) {
+        return sendError(res, 400, "Invalid service ID.");
+    }
 
-        if (!deletedService) {
-            return sendError(res, 404, "Service not found.");
-        }
+    const deletedService = await servicesCollection.findOneAndDelete({
+        _id: new ObjectId(req.params.id),
+    });
 
-        return sendSuccess(res, "Service deleted successfully.", {
-            deletedServiceId: String(deletedService._id),
-        });
-    },
-);
+    if (!deletedService) {
+        return sendError(res, 404, "Service not found.");
+    }
+
+    return sendSuccess(res, "Service deleted successfully.", {
+        deletedServiceId: String(deletedService._id),
+    });
+});
 
 // ========================================
 // 13. APPOINTMENT RELATED APIs
