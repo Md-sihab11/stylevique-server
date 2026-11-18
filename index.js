@@ -621,20 +621,6 @@ function buildServiceSnapshot(service) {
     };
 }
 
-function getBearerToken(req) {
-    const authorizationHeader = req.headers.authorization;
-
-    if (
-        typeof authorizationHeader !== "string" ||
-        !authorizationHeader.startsWith("Bearer ")
-    ) {
-        return null;
-    }
-
-    const token = authorizationHeader.slice("Bearer ".length).trim();
-    return token || null;
-}
-
 /**
  * Parse "YYYY-MM-DD" and "HH:mm" in the server's local timezone and reject
  * impossible dates such as 2026-02-30.
@@ -814,40 +800,51 @@ function buildCustomerMap(users) {
 // ========================================
 
 /**
- * Verify the Better Auth JWT, then load the current user from MongoDB.
+ * Verify the Better Auth JWT and load the user from MongoDB.
  *
- * We deliberately do NOT trust role or blocked status from the JWT. A role
- * could have changed or the account could have been blocked after the token
- * was issued. The database is the source of truth.
+ * We never trust the role or blocked status inside the token. An account may
+ * have been blocked or promoted after the token was created, so MongoDB is
+ * always the source of truth.
  */
 async function verifyToken(req, res, next) {
+    if (authenticationConfigurationError || !remoteJwks) {
+        return sendError(
+            res,
+            503,
+            authenticationConfigurationError ||
+            "Authentication is not configured on this server.",
+        );
+    }
+
+    if (!database) {
+        return sendError(res, 503, "The database is currently unavailable.");
+    }
+
+    const authorizationHeader = req.headers.authorization;
+
+    if (
+        typeof authorizationHeader !== "string" ||
+        !authorizationHeader.startsWith("Bearer ")
+    ) {
+        return sendError(
+            res,
+            401,
+            "Authentication required. Send a valid Bearer token.",
+        );
+    }
+
+    const token = authorizationHeader.slice("Bearer ".length).trim();
+
+    if (!token) {
+        return sendError(
+            res,
+            401,
+            "Authentication required. Send a valid Bearer token.",
+        );
+    }
+
     try {
-        if (authenticationConfigurationError) {
-            return sendError(res, 503, authenticationConfigurationError);
-        }
-
-        if (!remoteJwks) {
-            return sendError(
-                res,
-                503,
-                "Authentication is not configured on this server.",
-            );
-        }
-
-        if (!database) {
-            return sendError(res, 503, "The database is currently unavailable.");
-        }
-
-        const token = getBearerToken(req);
-
-        if (!token) {
-            return sendError(
-                res,
-                401,
-                "Authentication required. Send a valid Bearer token.",
-            );
-        }
-
+        // jose checks the signature, expiration, issuer and audience.
         const { payload } = await jwtVerify(token, remoteJwks, {
             issuer: BETTER_AUTH_ISSUER,
             audience: BETTER_AUTH_AUDIENCE,
@@ -868,9 +865,7 @@ async function verifyToken(req, res, next) {
             );
         }
 
-        const user = normalizeUser(userDocument);
-
-        if (user.isBlocked) {
+        if (userDocument.isBlocked === true) {
             return sendError(
                 res,
                 403,
@@ -878,12 +873,10 @@ async function verifyToken(req, res, next) {
             );
         }
 
-        req.user = user;
+        req.user = normalizeUser(userDocument);
         next();
     } catch (error) {
-        const errorCode = error?.code || "";
-
-        if (errorCode === "ERR_JWT_EXPIRED") {
+        if (error?.code === "ERR_JWT_EXPIRED") {
             return sendError(
                 res,
                 401,
@@ -891,10 +884,10 @@ async function verifyToken(req, res, next) {
             );
         }
 
-        // A JWKS network/timeout problem is a server-side availability issue, not
-        // proof that the user's token is invalid.
-        if (errorCode.startsWith("ERR_JWKS")) {
-            console.error("JWKS verification service unavailable:", errorCode);
+        // A JWKS network problem means authentication cannot be checked right
+        // now. It is a temporary server problem, not proof of a bad token.
+        if (String(error?.code || "").startsWith("ERR_JWKS")) {
+            console.error("JWKS verification service unavailable:", error.code);
             return sendError(
                 res,
                 503,
@@ -904,9 +897,8 @@ async function verifyToken(req, res, next) {
 
         console.warn(
             "JWT verification failed:",
-            errorCode || error?.name || "UnknownError",
+            error?.code || error?.name || "UnknownError",
         );
-
         return sendError(res, 401, "Invalid authentication token.");
     }
 }
