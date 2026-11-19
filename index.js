@@ -9,20 +9,16 @@ import { createRemoteJWKSet, jwtVerify } from "jose";
 import Stripe from "stripe";
 
 // ========================================
-// 2. ENVIRONMENT CONFIGURATION
+// Environment Configuration
 // ========================================
 
-// Values come from .env or from the hosting provider's environment settings.
 const NODE_ENV = process.env.NODE_ENV || "development";
 const PORT = Number(process.env.PORT) || 5000;
 
 const MONGODB_URI = (process.env.MONGODB_URI || "").trim();
 const DB_NAME = (process.env.DB_NAME || "stylevique").trim();
-
-// Better Auth stores its users in the "user" collection by default.
 const AUTH_USER_COLLECTION = (process.env.AUTH_USER_COLLECTION || "user").trim();
 
-// CLIENT_URL can contain one frontend URL or a comma-separated list.
 const CLIENT_URLS = [
     ...new Set(
         (process.env.CLIENT_URL || "http://localhost:3000")
@@ -33,7 +29,6 @@ const CLIENT_URLS = [
 ];
 const CLIENT_URL = CLIENT_URLS[0] || "http://localhost:3000";
 
-// Better Auth uses its base URL as both the JWT issuer and audience.
 const BETTER_AUTH_JWKS_URL = (
     process.env.BETTER_AUTH_JWKS_URL || `${CLIENT_URL}/api/auth/jwks`
 ).trim();
@@ -51,69 +46,48 @@ const STRIPE_CURRENCY = (process.env.STRIPE_CURRENCY || "usd").trim().toLowerCas
 const IMGBB_API_KEY = (process.env.IMGBB_API_KEY || "").trim();
 const ADMIN_EMAIL = (process.env.ADMIN_EMAIL || "").trim().toLowerCase();
 
-const configuredUploadSize = Number(process.env.MAX_UPLOAD_SIZE_MB);
 const MAX_UPLOAD_SIZE_MB =
-    configuredUploadSize > 0 ? Math.min(configuredUploadSize, 25) : 5;
+    Number(process.env.MAX_UPLOAD_SIZE_MB) > 0
+        ? Math.min(Number(process.env.MAX_UPLOAD_SIZE_MB), 25)
+        : 5;
 const MAX_UPLOAD_SIZE_BYTES = MAX_UPLOAD_SIZE_MB * 1024 * 1024;
 
 const IS_ADMIN_PROMOTION_COMMAND = process.argv[2] === "promote-admin";
 
-// Create the key set once. jose caches Better Auth's public keys for us.
-let remoteJwks = null;
-let authenticationConfigurationError = null;
+// ========================================
+// Stripe Configuration
+// ========================================
 
-try {
-    remoteJwks = createRemoteJWKSet(new URL(BETTER_AUTH_JWKS_URL), {
-        cacheMaxAge: 10 * 60 * 1000,
-        timeoutDuration: 5000,
-    });
-} catch {
-    authenticationConfigurationError =
-        "BETTER_AUTH_JWKS_URL is not a valid URL. Protected routes are unavailable.";
-}
-
-// Stripe is optional. Endpoints that need it return 503 when it is missing.
 const stripe = STRIPE_SECRET_KEY ? new Stripe(STRIPE_SECRET_KEY) : null;
 
 // ========================================
-// 3. EXPRESS APP INITIALIZATION
+// Express App Initialization
 // ========================================
 
 const app = express();
-
-// Do not advertise that this server runs Express.
 app.disable("x-powered-by");
 
-// In production the API is normally behind a reverse proxy (for example
-// Render, Railway, Nginx or Vercel). This lets rate limiting see the real IP.
 if (NODE_ENV === "production") {
     app.set("trust proxy", 1);
 }
 
 // ========================================
-// 4. MIDDLEWARE CONFIGURATION
+// Middleware
 // ========================================
 
-// Helmet adds security-related HTTP response headers.
 app.use(
     helmet({
-        // API responses are JSON, but this also lets uploaded/remote images be
-        // embedded by the frontend when needed.
         crossOriginResourcePolicy: { policy: "cross-origin" },
     }),
 );
 
 const corsOptions = {
     origin(origin, callback) {
-        // Requests without an Origin header include server-to-server calls,
-        // Stripe webhooks and tools such as Postman. Browser requests must match
-        // an explicitly allowed origin.
         if (!origin || CLIENT_URLS.includes(origin)) {
             return callback(null, true);
         }
-
         return callback(
-            httpError(403, "This origin is not allowed to access the API."),
+            new Error("This origin is not allowed to access the API."),
         );
     },
     methods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
@@ -125,31 +99,26 @@ const corsOptions = {
 
 app.use(cors(corsOptions));
 
-// A small request logger. It never logs headers, request bodies, tokens or
-// payment details. Query strings are removed because they can contain session
-// identifiers.
 app.use((req, res, next) => {
     const startedAt = Date.now();
-
     res.on("finish", () => {
         const pathWithoutQuery = req.originalUrl.split("?")[0];
         const duration = Date.now() - startedAt;
         console.log(`${req.method} ${pathWithoutQuery} ${res.statusCode} ${duration}ms`);
     });
-
     next();
 });
 
-// IMPORTANT: Stripe signs the raw request body. This route MUST be registered
-// before express.json(), otherwise signature verification will always fail.
+// Stripe webhook MUST use raw body before express.json()
 app.post(
     "/api/payments/webhook",
     express.raw({ type: "application/json", limit: "1mb" }),
-    stripeWebhookHandler,
+    (req, res, next) => {
+        // stripeWebhookHandler is defined later; hoisting works for function declarations
+        stripeWebhookHandler(req, res, next);
+    },
 );
 
-// Basic rate limiting for the whole API. The webhook above is intentionally
-// registered first so Stripe retries are not blocked by browser rate limits.
 const generalApiLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
     limit: 300,
@@ -163,7 +132,6 @@ const generalApiLimiter = rateLimit({
     },
 });
 
-// Stricter limits for actions that create records or cost money.
 const bookingLimiter = rateLimit({
     windowMs: 10 * 60 * 1000,
     limit: 30,
@@ -204,22 +172,18 @@ const uploadLimiter = rateLimit({
 });
 
 app.use("/api", generalApiLimiter);
-
-// Normal JSON parsing for every route except the Stripe webhook handled above.
 app.use(express.json({ limit: "1mb" }));
 app.use(express.urlencoded({ extended: false, limit: "1mb" }));
 
-// Sensitive API responses should not be cached by browsers or proxies.
 app.use("/api", (req, res, next) => {
     res.setHeader("Cache-Control", "no-store");
     next();
 });
 
 // ========================================
-// 5. MONGODB CONNECTION
+// MongoDB Connection
 // ========================================
 
-// These variables are filled once when the server starts.
 let mongoClient = null;
 let database = null;
 let usersCollection = null;
@@ -252,14 +216,11 @@ async function connectToMongoDB() {
         mongoClient = client;
         database = connectedDatabase;
 
-        // Better Auth owns the user collection. The other three collections
-        // belong to this API.
         usersCollection = database.collection(AUTH_USER_COLLECTION);
         servicesCollection = database.collection("services");
         appointmentsCollection = database.collection("appointments");
         transactionsCollection = database.collection("transactions");
 
-        // Atlas is a replica set, so multi-document transactions are available.
         const serverInfo = await database.command({ hello: 1 });
         supportsTransactions =
             Boolean(serverInfo.setName) || serverInfo.msg === "isdbgrid";
@@ -278,12 +239,10 @@ async function connectToMongoDB() {
 }
 
 // ========================================
-// 6. DATABASE INDEXES
+// Database Indexes
 // ========================================
 
 async function ensureDatabaseIndexes() {
-    // The unique partial index on activeSlotKey is the database-level guarantee
-    // that two customers cannot reserve the same date and time slot.
     await usersCollection.createIndex(
         { role: 1, createdAt: -1 },
         { name: "users_role_created" },
@@ -354,17 +313,13 @@ async function ensureDatabaseIndexes() {
 }
 
 // ========================================
-// 8. COMMON HELPER FUNCTIONS
+// Common Helper Functions
 // ========================================
 
-/**
- * Create an error that is safe to send to the client. The central error
- * handler returns errors with a statusCode to the caller. Any other error is
- * logged and returned as a generic 500 response.
- */
-function httpError(statusCode, message) {
+function httpError(statusCode, message, details) {
     const error = new Error(message);
     error.statusCode = statusCode;
+    error.details = details;
     return error;
 }
 
@@ -376,7 +331,7 @@ function sendSuccess(res, message, data = {}, statusCode = 200) {
     });
 }
 
-function sendError(res, statusCode, message, details = undefined) {
+function sendError(res, statusCode, message, details) {
     const response = {
         success: false,
         message,
@@ -389,8 +344,6 @@ function sendError(res, statusCode, message, details = undefined) {
     return res.status(statusCode).json(response);
 }
 
-// Escape user input before putting it in a MongoDB regular expression. This
-// prevents a customer from injecting regex operators into a search query.
 function escapeRegex(value) {
     return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
@@ -416,11 +369,6 @@ function parseObjectId(value) {
     }
 }
 
-/**
- * Better Auth exposes user.id as a string while the MongoDB adapter stores the
- * actual primary key in _id (normally as an ObjectId). This filter supports
- * both formats, plus a legacy "id" field, without assuming one storage type.
- */
 function buildUserIdentityFilter(userId) {
     const stringId = String(userId);
 
@@ -476,8 +424,6 @@ function normalizeUser(user) {
         email: user.email ?? "",
         image: user.image ?? null,
         phone: user.phone ?? "",
-        // Missing role means a normal customer (Better Auth may not set the field
-        // on accounts created before the role field was added).
         role: user.role === "admin" ? "admin" : "customer",
         isBlocked: user.isBlocked === true,
         emailVerified: user.emailVerified === true,
@@ -571,10 +517,6 @@ function buildServiceSnapshot(service) {
     };
 }
 
-/**
- * Parse "YYYY-MM-DD" and "HH:mm" in the server's local timezone and reject
- * impossible dates such as 2026-02-30.
- */
 function parseAppointmentDateTime(dateString, timeSlot) {
     const dateMatch = /^(\d{4})-(\d{2})-(\d{2})$/.exec(dateString);
     const timeMatch = /^(\d{2}):(\d{2})$/.exec(timeSlot);
@@ -619,9 +561,6 @@ function roundMoney(value) {
     return Math.round((Number(value) + Number.EPSILON) * 100) / 100;
 }
 
-// Stripe expects the smallest currency unit. Most currencies use 2 decimals,
-// but some use 0 or 3. Getting this wrong would charge the customer 100 times
-// too much or too little.
 const CURRENCY_DECIMALS = {
     bif: 0,
     clp: 0,
@@ -692,16 +631,22 @@ function buildCustomerMap(users) {
 }
 
 // ========================================
-// 9. AUTHENTICATION MIDDLEWARE
+// Authentication Middleware
 // ========================================
 
-/**
- * Verify the Better Auth JWT and load the user from MongoDB.
- *
- * We never trust the role or blocked status inside the token. An account may
- * have been blocked or promoted after the token was created, so MongoDB is
- * always the source of truth.
- */
+let remoteJwks = null;
+let authenticationConfigurationError = null;
+
+try {
+    remoteJwks = createRemoteJWKSet(new URL(BETTER_AUTH_JWKS_URL), {
+        cacheMaxAge: 10 * 60 * 1000,
+        timeoutDuration: 5000,
+    });
+} catch {
+    authenticationConfigurationError =
+        "BETTER_AUTH_JWKS_URL is not a valid URL. Protected routes are unavailable.";
+}
+
 async function verifyToken(req, res, next) {
     if (authenticationConfigurationError || !remoteJwks) {
         return sendError(
@@ -740,7 +685,6 @@ async function verifyToken(req, res, next) {
     }
 
     try {
-        // jose checks the signature, expiration, issuer and audience.
         const { payload } = await jwtVerify(token, remoteJwks, {
             issuer: BETTER_AUTH_ISSUER,
             audience: BETTER_AUTH_AUDIENCE,
@@ -780,8 +724,6 @@ async function verifyToken(req, res, next) {
             );
         }
 
-        // A JWKS network problem means authentication cannot be checked right
-        // now. It is a temporary server problem, not proof of a bad token.
         if (String(error?.code || "").startsWith("ERR_JWKS")) {
             console.error("JWKS verification service unavailable:", error.code);
             return sendError(
@@ -800,10 +742,9 @@ async function verifyToken(req, res, next) {
 }
 
 // ========================================
-// 10. ROLE VERIFICATION MIDDLEWARE
+// Role Verification Middleware
 // ========================================
 
-// Only customers may book appointments and manage their own bookings.
 function verifyCustomer(req, res, next) {
     if (!req.user) {
         return sendError(res, 401, "Authentication required.");
@@ -824,7 +765,6 @@ function verifyCustomer(req, res, next) {
     next();
 }
 
-// Only administrators may manage services, users, appointments and payments.
 function verifyAdmin(req, res, next) {
     if (!req.user) {
         return sendError(res, 401, "Authentication required.");
@@ -842,7 +782,7 @@ function verifyAdmin(req, res, next) {
 }
 
 // ========================================
-// 11. IMAGE UPLOAD APIs
+// Image Upload Configuration
 // ========================================
 
 const ALLOWED_IMAGE_MIME_TYPES = new Set([
@@ -852,8 +792,6 @@ const ALLOWED_IMAGE_MIME_TYPES = new Set([
     "image/gif",
 ]);
 
-// Multer keeps the uploaded file in memory. We never write uploaded files to
-// the server's disk. After validation the buffer is sent to ImgBB.
 const imageUpload = multer({
     storage: multer.memoryStorage(),
     limits: {
@@ -875,10 +813,6 @@ const imageUpload = multer({
     },
 });
 
-/**
- * MIME types come from the browser and can be faked. Checking a few magic
- * bytes gives us a second, cheap validation layer before forwarding the file.
- */
 function hasValidImageSignature(buffer, mimeType) {
     if (!Buffer.isBuffer(buffer) || buffer.length < 12) {
         return false;
@@ -907,10 +841,6 @@ function hasValidImageSignature(buffer, mimeType) {
     }
 }
 
-/**
- * Send the in-memory image to ImgBB and return its hosted URL.
- * The API key is used only on the server and is never sent to the browser.
- */
 async function uploadImageToImgBB(file) {
     const formData = new FormData();
     formData.append("image", file.buffer.toString("base64"));
@@ -919,8 +849,7 @@ async function uploadImageToImgBB(file) {
     let response;
 
     try {
-        response = await fetch(
-            `https://api.imgbb.com/1/upload?key=${encodeURIComponent(IMGBB_API_KEY)}`,
+        response = await fetch(`https://api.imgbb.com/1/upload?key=${encodeURIComponent(IMGBB_API_KEY)}`,
             {
                 method: "POST",
                 body: formData,
@@ -944,7 +873,6 @@ async function uploadImageToImgBB(file) {
     }
 
     if (!response.ok || !payload?.success || !payload?.data?.url) {
-        // Log only the provider's status/code, never the API key or image data.
         console.error(
             "ImgBB rejected the upload. HTTP status:",
             response.status,
@@ -960,58 +888,10 @@ async function uploadImageToImgBB(file) {
     return payload.data.display_url || payload.data.url;
 }
 
-// Any authenticated user may upload an image. Customers use this for profile
-// pictures and admins use it before creating a service.
-app.post(
-    "/api/uploads/image",
-    uploadLimiter,
-    verifyToken,
-    imageUpload.single("image"),
-    async (req, res) => {
-        if (!IMGBB_API_KEY) {
-            return sendError(
-                res,
-                503,
-                "Image uploads are not configured yet. Add IMGBB_API_KEY on the server.",
-            );
-        }
-
-        if (!req.file) {
-            return sendError(
-                res,
-                400,
-                "No image was supplied. Upload it as multipart/form-data using the field name \"image\".",
-            );
-        }
-
-        if (!hasValidImageSignature(req.file.buffer, req.file.mimetype)) {
-            return sendError(
-                res,
-                422,
-                "The uploaded file does not look like a valid image.",
-            );
-        }
-
-        const imageUrl = await uploadImageToImgBB(req.file);
-
-        return sendSuccess(
-            res,
-            "Image uploaded successfully.",
-            {
-                url: imageUrl,
-                mimeType: req.file.mimetype,
-                size: req.file.size,
-            },
-            201,
-        );
-    },
-);
-
 // ========================================
-// 12. SERVICE RELATED APIs
+// Services Related APIs
 // ========================================
 
-// Public list: customers only see active services.
 app.get("/api/services", async (req, res) => {
     const page = Number(req.query.page || 1);
     const limit = Number(req.query.limit || 12);
@@ -1059,8 +939,6 @@ app.get("/api/services", async (req, res) => {
         ]);
     }
 
-    // Escape search text before using it in a regular expression. Otherwise a
-    // customer could inject regex syntax into the MongoDB query.
     const filter = { status: "active" };
 
     if (search) {
@@ -1088,7 +966,6 @@ app.get("/api/services", async (req, res) => {
     });
 });
 
-// This route must be declared before /api/services/:id.
 app.get("/api/services/categories", async (req, res) => {
     const categories = await servicesCollection.distinct("category", {
         status: "active",
@@ -1099,98 +976,91 @@ app.get("/api/services/categories", async (req, res) => {
     });
 });
 
-// Admin: all services, including inactive ones.
-app.get(
-    "/api/admin/services",
-    verifyToken,
-    verifyAdmin,
-    async (req, res) => {
-        const page = Number(req.query.page || 1);
-        const limit = Number(req.query.limit || 12);
-        const search = String(req.query.search || "").trim();
-        const category = String(req.query.category || "").trim();
-        const status = String(req.query.status || "");
-        const sortName = String(req.query.sort || "newest");
+app.get("/api/admin/services", verifyToken, verifyAdmin, async (req, res) => {
+    const page = Number(req.query.page || 1);
+    const limit = Number(req.query.limit || 12);
+    const search = String(req.query.search || "").trim();
+    const category = String(req.query.category || "").trim();
+    const status = String(req.query.status || "");
+    const sortName = String(req.query.sort || "newest");
 
-        if (!Number.isInteger(page) || page < 1) {
-            return sendError(res, 422, "Invalid query parameters.", [
-                { field: "page", message: "Page must be a positive whole number." },
-            ]);
-        }
-
-        if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
-            return sendError(res, 422, "Invalid query parameters.", [
-                { field: "limit", message: "Limit must be between 1 and 100." },
-            ]);
-        }
-
-        if (search.length > 100) {
-            return sendError(res, 422, "Invalid query parameters.", [
-                { field: "search", message: "Search must be 100 characters or fewer." },
-            ]);
-        }
-
-        if (category.length > 80) {
-            return sendError(res, 422, "Invalid query parameters.", [
-                { field: "category", message: "Category must be 80 characters or fewer." },
-            ]);
-        }
-
-        if (status && !["active", "inactive"].includes(status)) {
-            return sendError(res, 422, "Invalid query parameters.", [
-                { field: "status", message: "Status must be active or inactive." },
-            ]);
-        }
-
-        const sortOptions = {
-            newest: { createdAt: -1 },
-            oldest: { createdAt: 1 },
-            price_asc: { price: 1, createdAt: -1 },
-            price_desc: { price: -1, createdAt: -1 },
-        };
-
-        if (!sortOptions[sortName]) {
-            return sendError(res, 422, "Invalid query parameters.", [
-                {
-                    field: "sort",
-                    message: "Sort must be newest, oldest, price_asc or price_desc.",
-                },
-            ]);
-        }
-
-        const filter = {};
-
-        if (status) {
-            filter.status = status;
-        }
-
-        if (search) {
-            filter.serviceName = { $regex: escapeRegex(search), $options: "i" };
-        }
-
-        if (category) {
-            filter.category = { $regex: `^${escapeRegex(category)}$`, $options: "i" };
-        }
-
-        const skip = (page - 1) * limit;
-        const [services, totalItems] = await Promise.all([
-            servicesCollection
-                .find(filter)
-                .sort(sortOptions[sortName])
-                .skip(skip)
-                .limit(limit)
-                .toArray(),
-            servicesCollection.countDocuments(filter),
+    if (!Number.isInteger(page) || page < 1) {
+        return sendError(res, 422, "Invalid query parameters.", [
+            { field: "page", message: "Page must be a positive whole number." },
         ]);
+    }
 
-        return sendSuccess(res, "Services retrieved successfully.", {
-            services: services.map(normalizeService),
-            pagination: buildPagination(page, limit, totalItems),
-        });
-    },
-);
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+        return sendError(res, 422, "Invalid query parameters.", [
+            { field: "limit", message: "Limit must be between 1 and 100." },
+        ]);
+    }
 
-// Public service details. Inactive services are hidden from customers.
+    if (search.length > 100) {
+        return sendError(res, 422, "Invalid query parameters.", [
+            { field: "search", message: "Search must be 100 characters or fewer." },
+        ]);
+    }
+
+    if (category.length > 80) {
+        return sendError(res, 422, "Invalid query parameters.", [
+            { field: "category", message: "Category must be 80 characters or fewer." },
+        ]);
+    }
+
+    if (status && !["active", "inactive"].includes(status)) {
+        return sendError(res, 422, "Invalid query parameters.", [
+            { field: "status", message: "Status must be active or inactive." },
+        ]);
+    }
+
+    const sortOptions = {
+        newest: { createdAt: -1 },
+        oldest: { createdAt: 1 },
+        price_asc: { price: 1, createdAt: -1 },
+        price_desc: { price: -1, createdAt: -1 },
+    };
+
+    if (!sortOptions[sortName]) {
+        return sendError(res, 422, "Invalid query parameters.", [
+            {
+                field: "sort",
+                message: "Sort must be newest, oldest, price_asc or price_desc.",
+            },
+        ]);
+    }
+
+    const filter = {};
+
+    if (status) {
+        filter.status = status;
+    }
+
+    if (search) {
+        filter.serviceName = { $regex: escapeRegex(search), $options: "i" };
+    }
+
+    if (category) {
+        filter.category = { $regex: `^${escapeRegex(category)}$`, $options: "i" };
+    }
+
+    const skip = (page - 1) * limit;
+    const [services, totalItems] = await Promise.all([
+        servicesCollection
+            .find(filter)
+            .sort(sortOptions[sortName])
+            .skip(skip)
+            .limit(limit)
+            .toArray(),
+        servicesCollection.countDocuments(filter),
+    ]);
+
+    return sendSuccess(res, "Services retrieved successfully.", {
+        services: services.map(normalizeService),
+        pagination: buildPagination(page, limit, totalItems),
+    });
+});
+
 app.get("/api/services/:id", async (req, res) => {
     if (!ObjectId.isValid(req.params.id)) {
         return sendError(res, 404, "Service not found.");
@@ -1210,7 +1080,6 @@ app.get("/api/services/:id", async (req, res) => {
     });
 });
 
-// Create a service (admin only).
 app.post("/api/services", verifyToken, verifyAdmin, async (req, res) => {
     const body = req.body || {};
     const errors = [];
@@ -1322,211 +1191,196 @@ app.post("/api/services", verifyToken, verifyAdmin, async (req, res) => {
     );
 });
 
-// Update service information (admin only). Historic appointment snapshots are
-// stored separately, so old bookings keep their original details.
-app.patch(
-    "/api/services/:id",
-    verifyToken,
-    verifyAdmin,
-    async (req, res) => {
-        if (!ObjectId.isValid(req.params.id)) {
-            return sendError(res, 400, "Invalid service ID.");
-        }
+app.patch("/api/services/:id", verifyToken, verifyAdmin, async (req, res) => {
+    if (!ObjectId.isValid(req.params.id)) {
+        return sendError(res, 400, "Invalid service ID.");
+    }
 
-        const body = req.body || {};
-        const errors = [];
-        const allowedFields = [
-            "serviceName",
-            "category",
-            "description",
-            "price",
-            "duration",
-            "image",
-        ];
-        const updateFields = {};
+    const body = req.body || {};
+    const errors = [];
+    const allowedFields = [
+        "serviceName",
+        "category",
+        "description",
+        "price",
+        "duration",
+        "image",
+    ];
+    const updateFields = {};
 
-        for (const field of Object.keys(body)) {
-            if (!allowedFields.includes(field)) {
-                errors.push({
-                    field,
-                    message:
-                        field === "status"
-                            ? "Use PATCH /api/services/:id/status to change status."
-                            : "This field is not allowed.",
-                });
-            }
-        }
-
-        if (body.serviceName !== undefined) {
-            const serviceName =
-                typeof body.serviceName === "string" ? body.serviceName.trim() : "";
-
-            if (serviceName.length < 2 || serviceName.length > 120) {
-                errors.push({
-                    field: "serviceName",
-                    message: "Service name must be between 2 and 120 characters.",
-                });
-            } else {
-                updateFields.serviceName = serviceName;
-            }
-        }
-
-        if (body.category !== undefined) {
-            const category =
-                typeof body.category === "string" ? body.category.trim() : "";
-
-            if (category.length < 2 || category.length > 80) {
-                errors.push({
-                    field: "category",
-                    message: "Category must be between 2 and 80 characters.",
-                });
-            } else {
-                updateFields.category = category;
-            }
-        }
-
-        if (body.description !== undefined) {
-            const description =
-                typeof body.description === "string" ? body.description.trim() : "";
-
-            if (description.length < 10 || description.length > 2000) {
-                errors.push({
-                    field: "description",
-                    message: "Description must be between 10 and 2000 characters.",
-                });
-            } else {
-                updateFields.description = description;
-            }
-        }
-
-        if (body.price !== undefined) {
-            const price = Number(body.price);
-
-            if (!Number.isFinite(price) || price <= 0 || price > 1000000) {
-                errors.push({
-                    field: "price",
-                    message: "Price must be greater than 0 and at most 1000000.",
-                });
-            } else {
-                updateFields.price = roundMoney(price);
-            }
-        }
-
-        if (body.duration !== undefined) {
-            const duration = Number(body.duration);
-
-            if (!Number.isInteger(duration) || duration <= 0 || duration > 1440) {
-                errors.push({
-                    field: "duration",
-                    message: "Duration must be a whole number between 1 and 1440 minutes.",
-                });
-            } else {
-                updateFields.duration = duration;
-            }
-        }
-
-        if (body.image !== undefined) {
-            const image = typeof body.image === "string" ? body.image.trim() : "";
-
-            if (!isValidUrl(image) || image.length > 2048) {
-                errors.push({ field: "image", message: "Image must be a valid URL." });
-            } else {
-                updateFields.image = image;
-            }
-        }
-
-        if (Object.keys(body).length === 0) {
+    for (const field of Object.keys(body)) {
+        if (!allowedFields.includes(field)) {
             errors.push({
-                field: "request",
-                message: "Provide at least one field to update.",
+                field,
+                message:
+                    field === "status"
+                        ? "Use PATCH /api/services/:id/status to change status."
+                        : "This field is not allowed.",
             });
         }
+    }
 
-        if (errors.length > 0) {
-            return sendError(
-                res,
-                422,
-                "Validation failed. Please check the submitted fields.",
-                errors,
-            );
+    if (body.serviceName !== undefined) {
+        const serviceName =
+            typeof body.serviceName === "string" ? body.serviceName.trim() : "";
+
+        if (serviceName.length < 2 || serviceName.length > 120) {
+            errors.push({
+                field: "serviceName",
+                message: "Service name must be between 2 and 120 characters.",
+            });
+        } else {
+            updateFields.serviceName = serviceName;
         }
+    }
 
-        const updatedService = await servicesCollection.findOneAndUpdate(
-            { _id: new ObjectId(req.params.id) },
-            {
-                $set: {
-                    ...updateFields,
-                    updatedAt: new Date(),
-                },
-            },
-            { returnDocument: "after" },
-        );
+    if (body.category !== undefined) {
+        const category =
+            typeof body.category === "string" ? body.category.trim() : "";
 
-        if (!updatedService) {
-            return sendError(res, 404, "Service not found.");
+        if (category.length < 2 || category.length > 80) {
+            errors.push({
+                field: "category",
+                message: "Category must be between 2 and 80 characters.",
+            });
+        } else {
+            updateFields.category = category;
         }
+    }
 
-        return sendSuccess(res, "Service updated successfully.", {
-            service: normalizeService(updatedService),
+    if (body.description !== undefined) {
+        const description =
+            typeof body.description === "string" ? body.description.trim() : "";
+
+        if (description.length < 10 || description.length > 2000) {
+            errors.push({
+                field: "description",
+                message: "Description must be between 10 and 2000 characters.",
+            });
+        } else {
+            updateFields.description = description;
+        }
+    }
+
+    if (body.price !== undefined) {
+        const price = Number(body.price);
+
+        if (!Number.isFinite(price) || price <= 0 || price > 1000000) {
+            errors.push({
+                field: "price",
+                message: "Price must be greater than 0 and at most 1000000.",
+            });
+        } else {
+            updateFields.price = roundMoney(price);
+        }
+    }
+
+    if (body.duration !== undefined) {
+        const duration = Number(body.duration);
+
+        if (!Number.isInteger(duration) || duration <= 0 || duration > 1440) {
+            errors.push({
+                field: "duration",
+                message: "Duration must be a whole number between 1 and 1440 minutes.",
+            });
+        } else {
+            updateFields.duration = duration;
+        }
+    }
+
+    if (body.image !== undefined) {
+        const image = typeof body.image === "string" ? body.image.trim() : "";
+
+        if (!isValidUrl(image) || image.length > 2048) {
+            errors.push({ field: "image", message: "Image must be a valid URL." });
+        } else {
+            updateFields.image = image;
+        }
+    }
+
+    if (Object.keys(body).length === 0) {
+        errors.push({
+            field: "request",
+            message: "Provide at least one field to update.",
         });
-    },
-);
+    }
 
-// Activate or deactivate a service (admin only).
-app.patch(
-    "/api/services/:id/status",
-    verifyToken,
-    verifyAdmin,
-    async (req, res) => {
-        if (!ObjectId.isValid(req.params.id)) {
-            return sendError(res, 400, "Invalid service ID.");
-        }
-
-        const body = req.body || {};
-        const status = body.status;
-
-        if (
-            Object.keys(body).length !== 1 ||
-            !["active", "inactive"].includes(status)
-        ) {
-            return sendError(
-                res,
-                422,
-                "Validation failed. Please check the submitted fields.",
-                [
-                    {
-                        field: "status",
-                        message: "Send exactly one status field set to active or inactive.",
-                    },
-                ],
-            );
-        }
-
-        const updatedService = await servicesCollection.findOneAndUpdate(
-            { _id: new ObjectId(req.params.id) },
-            {
-                $set: {
-                    status,
-                    updatedAt: new Date(),
-                },
-            },
-            { returnDocument: "after" },
-        );
-
-        if (!updatedService) {
-            return sendError(res, 404, "Service not found.");
-        }
-
-        return sendSuccess(
+    if (errors.length > 0) {
+        return sendError(
             res,
-            `Service ${status === "active" ? "activated" : "deactivated"} successfully.`,
-            { service: normalizeService(updatedService) },
+            422,
+            "Validation failed. Please check the submitted fields.",
+            errors,
         );
-    },
-);
+    }
 
-// Delete a service (admin only). Appointments keep their snapshot, so
-// historical information is still available after deletion.
+    const updatedService = await servicesCollection.findOneAndUpdate(
+        { _id: new ObjectId(req.params.id) },
+        {
+            $set: {
+                ...updateFields,
+                updatedAt: new Date(),
+            },
+        },
+        { returnDocument: "after" },
+    );
+
+    if (!updatedService) {
+        return sendError(res, 404, "Service not found.");
+    }
+
+    return sendSuccess(res, "Service updated successfully.", {
+        service: normalizeService(updatedService),
+    });
+});
+
+app.patch("/api/services/:id/status", verifyToken, verifyAdmin, async (req, res) => {
+    if (!ObjectId.isValid(req.params.id)) {
+        return sendError(res, 400, "Invalid service ID.");
+    }
+
+    const body = req.body || {};
+    const status = body.status;
+
+    if (
+        Object.keys(body).length !== 1 ||
+        !["active", "inactive"].includes(status)
+    ) {
+        return sendError(
+            res,
+            422,
+            "Validation failed. Please check the submitted fields.",
+            [
+                {
+                    field: "status",
+                    message: "Send exactly one status field set to active or inactive.",
+                },
+            ],
+        );
+    }
+
+    const updatedService = await servicesCollection.findOneAndUpdate(
+        { _id: new ObjectId(req.params.id) },
+        {
+            $set: {
+                status,
+                updatedAt: new Date(),
+            },
+        },
+        { returnDocument: "after" },
+    );
+
+    if (!updatedService) {
+        return sendError(res, 404, "Service not found.");
+    }
+
+    return sendSuccess(
+        res,
+        `Service ${status === "active" ? "activated" : "deactivated"} successfully.`,
+        { service: normalizeService(updatedService) },
+    );
+});
+
 app.delete("/api/services/:id", verifyToken, verifyAdmin, async (req, res) => {
     if (!ObjectId.isValid(req.params.id)) {
         return sendError(res, 400, "Invalid service ID.");
@@ -1546,11 +1400,9 @@ app.delete("/api/services/:id", verifyToken, verifyAdmin, async (req, res) => {
 });
 
 // ========================================
-// 13. APPOINTMENT RELATED APIs
+// Appointments Related APIs
 // ========================================
 
-// The salon has one shared booking slot per date/time. These are the only
-// time slots a customer may select. Keep this list in sync with the frontend.
 const TIME_SLOTS = Object.freeze([
     "09:00",
     "09:30",
@@ -1591,7 +1443,6 @@ async function attachCustomerInformation(appointments) {
     }));
 }
 
-// Book an appointment (customer only).
 app.post(
     "/api/appointments",
     bookingLimiter,
@@ -1691,9 +1542,6 @@ app.post(
 
         const activeSlotKey = buildActiveSlotKey(appointmentDate, timeSlot);
 
-        // This friendly check handles the normal case. The unique partial index
-        // on activeSlotKey is what stops two simultaneous requests from both
-        // booking the same slot.
         const slotAlreadyBooked = await appointmentsCollection.findOne({
             activeSlotKey,
         });
@@ -1709,11 +1557,11 @@ app.post(
         const now = new Date();
         const appointmentDocument = {
             serviceId: service._id,
-            customerId: req.user.id, // From the verified JWT, never from req.body.
+            customerId: req.user.id,
             appointmentDate,
             timeSlot,
             message,
-            servicePrice: service.price, // From MongoDB, never from req.body.
+            servicePrice: service.price,
             status: "pending",
             paymentStatus: "unpaid",
             serviceSnapshot: buildServiceSnapshot(service),
@@ -1739,8 +1587,6 @@ app.post(
                 201,
             );
         } catch (error) {
-            // 11000 is MongoDB's duplicate-key error code. It means another
-            // request inserted this activeSlotKey a moment before us.
             if (error?.code === 11000) {
                 return sendError(
                     res,
@@ -1754,63 +1600,55 @@ app.post(
     },
 );
 
-// A customer's own appointment history.
-app.get(
-    "/api/appointments/my",
-    verifyToken,
-    verifyCustomer,
-    async (req, res) => {
-        const page = Number(req.query.page || 1);
-        const limit = Number(req.query.limit || 20);
-        const status = String(req.query.status || "");
+app.get("/api/appointments/my", verifyToken, verifyCustomer, async (req, res) => {
+    const page = Number(req.query.page || 1);
+    const limit = Number(req.query.limit || 20);
+    const status = String(req.query.status || "");
 
-        if (!Number.isInteger(page) || page < 1) {
-            return sendError(res, 422, "Invalid query parameters.", [
-                { field: "page", message: "Page must be a positive whole number." },
-            ]);
-        }
-
-        if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
-            return sendError(res, 422, "Invalid query parameters.", [
-                { field: "limit", message: "Limit must be between 1 and 100." },
-            ]);
-        }
-
-        if (status && !APPOINTMENT_STATUSES.includes(status)) {
-            return sendError(res, 422, "Invalid query parameters.", [
-                {
-                    field: "status",
-                    message: "Status must be pending, confirmed or cancelled.",
-                },
-            ]);
-        }
-
-        const filter = { customerId: req.user.id };
-
-        if (status) {
-            filter.status = status;
-        }
-
-        const skip = (page - 1) * limit;
-        const [appointments, totalItems] = await Promise.all([
-            appointmentsCollection
-                .find(filter)
-                .sort({ appointmentDate: -1, timeSlot: -1 })
-                .skip(skip)
-                .limit(limit)
-                .toArray(),
-            appointmentsCollection.countDocuments(filter),
+    if (!Number.isInteger(page) || page < 1) {
+        return sendError(res, 422, "Invalid query parameters.", [
+            { field: "page", message: "Page must be a positive whole number." },
         ]);
+    }
 
-        return sendSuccess(res, "Your appointments were retrieved successfully.", {
-            appointments: appointments.map(normalizeAppointment),
-            pagination: buildPagination(page, limit, totalItems),
-        });
-    },
-);
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+        return sendError(res, 422, "Invalid query parameters.", [
+            { field: "limit", message: "Limit must be between 1 and 100." },
+        ]);
+    }
 
-// Get one appointment. Customers may only read their own appointment; admins
-// may read any appointment.
+    if (status && !APPOINTMENT_STATUSES.includes(status)) {
+        return sendError(res, 422, "Invalid query parameters.", [
+            {
+                field: "status",
+                message: "Status must be pending, confirmed or cancelled.",
+            },
+        ]);
+    }
+
+    const filter = { customerId: req.user.id };
+
+    if (status) {
+        filter.status = status;
+    }
+
+    const skip = (page - 1) * limit;
+    const [appointments, totalItems] = await Promise.all([
+        appointmentsCollection
+            .find(filter)
+            .sort({ appointmentDate: -1, timeSlot: -1 })
+            .skip(skip)
+            .limit(limit)
+            .toArray(),
+        appointmentsCollection.countDocuments(filter),
+    ]);
+
+    return sendSuccess(res, "Your appointments were retrieved successfully.", {
+        appointments: appointments.map(normalizeAppointment),
+        pagination: buildPagination(page, limit, totalItems),
+    });
+});
+
 app.get("/api/appointments/:id", verifyToken, async (req, res) => {
     if (!ObjectId.isValid(req.params.id)) {
         return sendError(res, 400, "Invalid appointment ID.");
@@ -1833,8 +1671,6 @@ app.get("/api/appointments/:id", verifyToken, async (req, res) => {
     });
 });
 
-// Cancel a pending appointment (customer only). Removing activeSlotKey releases
-// the time slot for someone else.
 app.patch(
     "/api/appointments/:id/cancel",
     verifyToken,
@@ -1908,76 +1744,68 @@ app.patch(
     },
 );
 
-// All appointment requests (admin only).
-app.get(
-    "/api/admin/appointments",
-    verifyToken,
-    verifyAdmin,
-    async (req, res) => {
-        const page = Number(req.query.page || 1);
-        const limit = Number(req.query.limit || 20);
-        const status = String(req.query.status || "");
-        const date = String(req.query.date || "");
+app.get("/api/admin/appointments", verifyToken, verifyAdmin, async (req, res) => {
+    const page = Number(req.query.page || 1);
+    const limit = Number(req.query.limit || 20);
+    const status = String(req.query.status || "");
+    const date = String(req.query.date || "");
 
-        if (!Number.isInteger(page) || page < 1) {
-            return sendError(res, 422, "Invalid query parameters.", [
-                { field: "page", message: "Page must be a positive whole number." },
-            ]);
-        }
-
-        if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
-            return sendError(res, 422, "Invalid query parameters.", [
-                { field: "limit", message: "Limit must be between 1 and 100." },
-            ]);
-        }
-
-        if (status && !APPOINTMENT_STATUSES.includes(status)) {
-            return sendError(res, 422, "Invalid query parameters.", [
-                {
-                    field: "status",
-                    message: "Status must be pending, confirmed or cancelled.",
-                },
-            ]);
-        }
-
-        if (date && !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
-            return sendError(res, 422, "Invalid query parameters.", [
-                { field: "date", message: "Date must use the YYYY-MM-DD format." },
-            ]);
-        }
-
-        const filter = {};
-
-        if (status) {
-            filter.status = status;
-        }
-
-        if (date) {
-            filter.appointmentDate = date;
-        }
-
-        const skip = (page - 1) * limit;
-        const [appointments, totalItems] = await Promise.all([
-            appointmentsCollection
-                .find(filter)
-                .sort({ createdAt: -1 })
-                .skip(skip)
-                .limit(limit)
-                .toArray(),
-            appointmentsCollection.countDocuments(filter),
+    if (!Number.isInteger(page) || page < 1) {
+        return sendError(res, 422, "Invalid query parameters.", [
+            { field: "page", message: "Page must be a positive whole number." },
         ]);
+    }
 
-        const enrichedAppointments = await attachCustomerInformation(appointments);
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+        return sendError(res, 422, "Invalid query parameters.", [
+            { field: "limit", message: "Limit must be between 1 and 100." },
+        ]);
+    }
 
-        return sendSuccess(res, "Appointments retrieved successfully.", {
-            appointments: enrichedAppointments,
-            pagination: buildPagination(page, limit, totalItems),
-        });
-    },
-);
+    if (status && !APPOINTMENT_STATUSES.includes(status)) {
+        return sendError(res, 422, "Invalid query parameters.", [
+            {
+                field: "status",
+                message: "Status must be pending, confirmed or cancelled.",
+            },
+        ]);
+    }
 
-// Confirm or cancel an appointment (admin only). Only the transitions below
-// are accepted. Arbitrary status changes are rejected with 409 Conflict.
+    if (date && !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+        return sendError(res, 422, "Invalid query parameters.", [
+            { field: "date", message: "Date must use the YYYY-MM-DD format." },
+        ]);
+    }
+
+    const filter = {};
+
+    if (status) {
+        filter.status = status;
+    }
+
+    if (date) {
+        filter.appointmentDate = date;
+    }
+
+    const skip = (page - 1) * limit;
+    const [appointments, totalItems] = await Promise.all([
+        appointmentsCollection
+            .find(filter)
+            .sort({ createdAt: -1 })
+            .skip(skip)
+            .limit(limit)
+            .toArray(),
+        appointmentsCollection.countDocuments(filter),
+    ]);
+
+    const enrichedAppointments = await attachCustomerInformation(appointments);
+
+    return sendSuccess(res, "Appointments retrieved successfully.", {
+        appointments: enrichedAppointments,
+        pagination: buildPagination(page, limit, totalItems),
+    });
+});
+
 app.patch(
     "/api/admin/appointments/:id/status",
     verifyToken,
@@ -2046,14 +1874,13 @@ app.patch(
         if (newStatus === "cancelled") {
             updateDocument.$set.cancelledAt = now;
             updateDocument.$set.cancelledBy = req.user.id;
-            // Release the slot so another customer can book it.
             updateDocument.$unset = { activeSlotKey: "" };
         }
 
         const updatedAppointment = await appointmentsCollection.findOneAndUpdate(
             {
                 _id: appointmentId,
-                status: appointment.status, // optimistic concurrency guard
+                status: appointment.status,
             },
             updateDocument,
             { returnDocument: "after" },
@@ -2081,17 +1908,15 @@ app.patch(
 );
 
 // ========================================
-// 14. USER RELATED APIs
+// Users Related APIs
 // ========================================
 
-// Current user's own profile.
 app.get("/api/users/me", verifyToken, async (req, res) => {
     return sendSuccess(res, "Profile retrieved successfully.", {
         user: req.user,
     });
 });
 
-// Customers and admins may update their own safe profile fields only.
 app.patch("/api/users/me", verifyToken, async (req, res) => {
     const body = req.body || {};
     const errors = [];
@@ -2188,88 +2013,75 @@ app.patch("/api/users/me", verifyToken, async (req, res) => {
     });
 });
 
-// Registered customers (admin only). Admin accounts are excluded because this
-// endpoint manages customers, not administrators.
-app.get(
-    "/api/admin/users",
-    verifyToken,
-    verifyAdmin,
-    async (req, res) => {
-        const page = Number(req.query.page || 1);
-        const limit = Number(req.query.limit || 20);
-        const search = String(req.query.search || "").trim();
+app.get("/api/admin/users", verifyToken, verifyAdmin, async (req, res) => {
+    const page = Number(req.query.page || 1);
+    const limit = Number(req.query.limit || 20);
+    const search = String(req.query.search || "").trim();
 
-        if (!Number.isInteger(page) || page < 1) {
-            return sendError(res, 422, "Invalid query parameters.", [
-                { field: "page", message: "Page must be a positive whole number." },
-            ]);
-        }
-
-        if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
-            return sendError(res, 422, "Invalid query parameters.", [
-                { field: "limit", message: "Limit must be between 1 and 100." },
-            ]);
-        }
-
-        if (search.length > 100) {
-            return sendError(res, 422, "Invalid query parameters.", [
-                { field: "search", message: "Search must be 100 characters or fewer." },
-            ]);
-        }
-
-        const filter = { role: { $ne: "admin" } };
-
-        if (search) {
-            const searchPattern = {
-                $regex: escapeRegex(search),
-                $options: "i",
-            };
-            filter.$or = [{ name: searchPattern }, { email: searchPattern }];
-        }
-
-        const skip = (page - 1) * limit;
-        const [users, totalItems] = await Promise.all([
-            usersCollection
-                .find(filter)
-                .sort({ createdAt: -1 })
-                .skip(skip)
-                .limit(limit)
-                .toArray(),
-            usersCollection.countDocuments(filter),
+    if (!Number.isInteger(page) || page < 1) {
+        return sendError(res, 422, "Invalid query parameters.", [
+            { field: "page", message: "Page must be a positive whole number." },
         ]);
+    }
 
-        return sendSuccess(res, "Customers retrieved successfully.", {
-            users: users.map(normalizeUser),
-            pagination: buildPagination(page, limit, totalItems),
-        });
-    },
-);
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+        return sendError(res, 422, "Invalid query parameters.", [
+            { field: "limit", message: "Limit must be between 1 and 100." },
+        ]);
+    }
 
-// One registered customer (admin only).
-app.get(
-    "/api/admin/users/:id",
-    verifyToken,
-    verifyAdmin,
-    async (req, res) => {
-        const userDocument = await findUserById(req.params.id);
+    if (search.length > 100) {
+        return sendError(res, 422, "Invalid query parameters.", [
+            { field: "search", message: "Search must be 100 characters or fewer." },
+        ]);
+    }
 
-        if (!userDocument) {
-            return sendError(res, 404, "Customer not found.");
-        }
+    const filter = { role: { $ne: "admin" } };
 
-        if (normalizeUser(userDocument).role === "admin") {
-            return sendError(
-                res,
-                403,
-                "Administrator accounts cannot be managed through the customer API.",
-            );
-        }
+    if (search) {
+        const searchPattern = {
+            $regex: escapeRegex(search),
+            $options: "i",
+        };
+        filter.$or = [{ name: searchPattern }, { email: searchPattern }];
+    }
 
-        return sendSuccess(res, "Customer retrieved successfully.", {
-            user: normalizeUser(userDocument),
-        });
-    },
-);
+    const skip = (page - 1) * limit;
+    const [users, totalItems] = await Promise.all([
+        usersCollection
+            .find(filter)
+            .sort({ createdAt: -1 })
+            .skip(skip)
+            .limit(limit)
+            .toArray(),
+        usersCollection.countDocuments(filter),
+    ]);
+
+    return sendSuccess(res, "Customers retrieved successfully.", {
+        users: users.map(normalizeUser),
+        pagination: buildPagination(page, limit, totalItems),
+    });
+});
+
+app.get("/api/admin/users/:id", verifyToken, verifyAdmin, async (req, res) => {
+    const userDocument = await findUserById(req.params.id);
+
+    if (!userDocument) {
+        return sendError(res, 404, "Customer not found.");
+    }
+
+    if (normalizeUser(userDocument).role === "admin") {
+        return sendError(
+            res,
+            403,
+            "Administrator accounts cannot be managed through the customer API.",
+        );
+    }
+
+    return sendSuccess(res, "Customer retrieved successfully.", {
+        user: normalizeUser(userDocument),
+    });
+});
 
 async function updateCustomerBlockedStatus(req, res, shouldBlock) {
     const userDocument = await findUserById(req.params.id);
@@ -2312,7 +2124,6 @@ async function updateCustomerBlockedStatus(req, res, shouldBlock) {
     );
 }
 
-// Block a customer (admin only).
 app.patch(
     "/api/admin/users/:id/block",
     verifyToken,
@@ -2322,7 +2133,6 @@ app.patch(
     },
 );
 
-// Unblock a customer (admin only).
 app.patch(
     "/api/admin/users/:id/unblock",
     verifyToken,
@@ -2333,93 +2143,83 @@ app.patch(
 );
 
 // ========================================
-// 15. DASHBOARD RELATED APIs
+// Dashboard Related APIs
 // ========================================
 
-app.get(
-    "/api/dashboard/customer",
-    verifyToken,
-    verifyCustomer,
-    async (req, res) => {
-        const customerId = req.user.id;
+app.get("/api/dashboard/customer", verifyToken, verifyCustomer, async (req, res) => {
+    const customerId = req.user.id;
 
-        const [pendingAppointments, confirmedAppointments, cancelledAppointments] =
-            await Promise.all([
-                appointmentsCollection.countDocuments({
-                    customerId,
-                    status: "pending",
-                }),
-                appointmentsCollection.countDocuments({
-                    customerId,
-                    status: "confirmed",
-                }),
-                appointmentsCollection.countDocuments({
-                    customerId,
-                    status: "cancelled",
-                }),
-            ]);
-
-        return sendSuccess(res, "Customer dashboard retrieved successfully.", {
-            totalAppointments:
-                pendingAppointments + confirmedAppointments + cancelledAppointments,
-            pendingAppointments,
-            confirmedAppointments,
-            cancelledAppointments,
-        });
-    },
-);
-
-app.get(
-    "/api/dashboard/admin",
-    verifyToken,
-    verifyAdmin,
-    async (req, res) => {
-        const [
-            totalRegisteredCustomers,
-            totalActiveServices,
-            pendingAppointments,
-            confirmedAppointments,
-            cancelledAppointments,
-            paymentRows,
-        ] = await Promise.all([
-            usersCollection.countDocuments({ role: { $ne: "admin" } }),
-            servicesCollection.countDocuments({ status: "active" }),
-            appointmentsCollection.countDocuments({ status: "pending" }),
-            appointmentsCollection.countDocuments({ status: "confirmed" }),
-            appointmentsCollection.countDocuments({ status: "cancelled" }),
-            transactionsCollection
-                .aggregate([
-                    { $match: { status: "paid" } },
-                    {
-                        $group: {
-                            _id: null,
-                            count: { $sum: 1 },
-                            totalAmount: { $sum: "$amount" },
-                        },
-                    },
-                ])
-                .toArray(),
+    const [pendingAppointments, confirmedAppointments, cancelledAppointments] =
+        await Promise.all([
+            appointmentsCollection.countDocuments({
+                customerId,
+                status: "pending",
+            }),
+            appointmentsCollection.countDocuments({
+                customerId,
+                status: "confirmed",
+            }),
+            appointmentsCollection.countDocuments({
+                customerId,
+                status: "cancelled",
+            }),
         ]);
 
-        const paymentSummary = paymentRows[0] ?? { count: 0, totalAmount: 0 };
+    return sendSuccess(res, "Customer dashboard retrieved successfully.", {
+        totalAppointments:
+            pendingAppointments + confirmedAppointments + cancelledAppointments,
+        pendingAppointments,
+        confirmedAppointments,
+        cancelledAppointments,
+    });
+});
 
-        return sendSuccess(res, "Admin dashboard retrieved successfully.", {
-            totalRegisteredCustomers,
-            totalActiveServices,
-            totalAppointments:
-                pendingAppointments + confirmedAppointments + cancelledAppointments,
-            pendingAppointments,
-            confirmedAppointments,
-            cancelledAppointments,
-            totalSuccessfulPayments: paymentSummary.count,
-            totalRevenue: roundMoney(paymentSummary.totalAmount || 0),
-            currency: STRIPE_CURRENCY,
-        });
-    },
-);
+app.get("/api/dashboard/admin", verifyToken, verifyAdmin, async (req, res) => {
+    const [
+        totalRegisteredCustomers,
+        totalActiveServices,
+        pendingAppointments,
+        confirmedAppointments,
+        cancelledAppointments,
+        paymentRows,
+    ] = await Promise.all([
+        usersCollection.countDocuments({ role: { $ne: "admin" } }),
+        servicesCollection.countDocuments({ status: "active" }),
+        appointmentsCollection.countDocuments({ status: "pending" }),
+        appointmentsCollection.countDocuments({ status: "confirmed" }),
+        appointmentsCollection.countDocuments({ status: "cancelled" }),
+        transactionsCollection
+            .aggregate([
+                { $match: { status: "paid" } },
+                {
+                    $group: {
+                        _id: null,
+                        count: { $sum: 1 },
+                        totalAmount: { $sum: "$amount" },
+                    },
+                },
+            ])
+            .toArray(),
+    ]);
+
+    const paymentSummary = paymentRows[0] ?? { count: 0, totalAmount: 0 };
+
+    return sendSuccess(res, "Admin dashboard retrieved successfully.", {
+        totalRegisteredCustomers,
+        totalActiveServices,
+        totalAppointments:
+            pendingAppointments + confirmedAppointments + cancelledAppointments,
+        pendingAppointments,
+        confirmedAppointments,
+        cancelledAppointments,
+        totalSuccessfulPayments: paymentSummary.count,
+        totalRevenue: roundMoney(paymentSummary.totalAmount || 0),
+        currency: STRIPE_CURRENCY,
+    });
+});
 
 // ========================================
-// 16. STRIPE CHECKOUT APIs
+// Payments Related APIs
 // ========================================
 
 function getPaymentIntentId(checkoutSession) {
@@ -2430,11 +2230,6 @@ function getPaymentIntentId(checkoutSession) {
     return checkoutSession.payment_intent?.id ?? null;
 }
 
-/**
- * Reuse an existing open Checkout Session when possible. This prevents a
- * customer from accidentally creating several open payment sessions for the
- * same appointment.
- */
 async function getReusableCheckoutSession(appointment, amount, currency) {
     if (!appointment.checkoutSessionId) {
         return null;
@@ -2464,9 +2259,6 @@ async function getReusableCheckoutSession(appointment, amount, currency) {
                 );
             }
 
-            // For asynchronous payment methods the session can complete before the
-            // money arrives. If Stripe already told us it failed, allow a retry with
-            // a new session. Otherwise ask the customer to wait for verification.
             const failedTransaction = await transactionsCollection.findOne({
                 stripeSessionId: existingSession.id,
                 status: "failed",
@@ -2488,8 +2280,6 @@ async function getReusableCheckoutSession(appointment, amount, currency) {
             throw error;
         }
 
-        // A missing session (for example after deleting it in the Stripe test
-        // dashboard) is not fatal: we simply create a new one.
         if (error?.code !== "resource_missing") {
             console.warn(
                 "Could not retrieve the existing Stripe Checkout Session:",
@@ -2501,7 +2291,6 @@ async function getReusableCheckoutSession(appointment, amount, currency) {
     }
 }
 
-// Create a Stripe Checkout Session for a confirmed, unpaid appointment.
 app.post(
     "/api/payments/checkout",
     checkoutLimiter,
@@ -2561,8 +2350,6 @@ app.post(
             );
         }
 
-        // The amount comes from the price saved at booking time. The browser
-        // cannot choose or change the amount.
         const amount = toMinorCurrencyUnits(
             appointment.servicePrice,
             STRIPE_CURRENCY,
@@ -2595,8 +2382,6 @@ app.post(
         try {
             checkoutSession = await stripe.checkout.sessions.create({
                 mode: "payment",
-                // Stripe manages enabled payment methods from the dashboard.
-                // Do not send the older payment_method_types parameter here.
                 line_items: [
                     {
                         quantity: 1,
@@ -2637,8 +2422,6 @@ app.post(
             );
         }
 
-        // Save the session reference. If this write fails, the verified webhook
-        // can still complete the payment because Stripe has our metadata.
         try {
             await appointmentsCollection.updateOne(
                 { _id: appointment._id },
@@ -2676,95 +2459,86 @@ app.post(
     },
 );
 
-// Read-only payment verification. This endpoint reports only what a verified
-// webhook has already stored. It never marks an appointment as paid.
-app.get(
-    "/api/payments/verify",
-    verifyToken,
-    verifyCustomer,
-    async (req, res) => {
-        const sessionId =
-            typeof req.query.session_id === "string"
-                ? req.query.session_id.trim()
-                : "";
+app.get("/api/payments/verify", verifyToken, verifyCustomer, async (req, res) => {
+    const sessionId =
+        typeof req.query.session_id === "string"
+            ? req.query.session_id.trim()
+            : "";
 
-        if (sessionId.length < 5 || sessionId.length > 255) {
-            return sendError(res, 422, "Invalid query parameters.", [
-                {
-                    field: "session_id",
-                    message: "A valid session_id is required.",
-                },
-            ]);
-        }
+    if (sessionId.length < 5 || sessionId.length > 255) {
+        return sendError(res, 422, "Invalid query parameters.", [
+            {
+                field: "session_id",
+                message: "A valid session_id is required.",
+            },
+        ]);
+    }
 
-        let appointment = await appointmentsCollection.findOne({
-            checkoutSessionId: sessionId,
+    let appointment = await appointmentsCollection.findOne({
+        checkoutSessionId: sessionId,
+        customerId: req.user.id,
+    });
+
+    let transaction = await transactionsCollection.findOne({
+        stripeSessionId: sessionId,
+        customerId: req.user.id,
+    });
+
+    if (!appointment && transaction) {
+        appointment = await appointmentsCollection.findOne({
+            _id: transaction.appointmentId,
             customerId: req.user.id,
         });
+    }
 
-        let transaction = await transactionsCollection.findOne({
+    if (!appointment) {
+        return sendError(
+            res,
+            404,
+            "No checkout session was found for your account.",
+        );
+    }
+
+    if (!transaction) {
+        transaction = await transactionsCollection.findOne({
             stripeSessionId: sessionId,
             customerId: req.user.id,
         });
+    }
 
-        if (!appointment && transaction) {
-            appointment = await appointmentsCollection.findOne({
-                _id: transaction.appointmentId,
-                customerId: req.user.id,
-            });
-        }
+    let paymentState = "pending";
 
-        if (!appointment) {
-            return sendError(
-                res,
-                404,
-                "No checkout session was found for your account.",
-            );
-        }
+    if (transaction?.status === "paid") {
+        paymentState = "paid";
+    } else if (transaction?.status === "failed") {
+        paymentState = "failed";
+    } else if (
+        appointment.paymentStatus === "paid" &&
+        appointment.checkoutSessionId === sessionId
+    ) {
+        paymentState = "paid";
+    }
 
-        if (!transaction) {
-            transaction = await transactionsCollection.findOne({
-                stripeSessionId: sessionId,
-                customerId: req.user.id,
-            });
-        }
+    const message =
+        paymentState === "paid"
+            ? "Payment verified successfully by the Stripe webhook."
+            : paymentState === "failed"
+                ? "Stripe reported that this payment failed. No successful transaction was recorded."
+                : "Payment is still being verified. If you just completed checkout, please wait a few seconds and refresh.";
 
-        let paymentState = "pending";
-
-        // The transaction must belong to THIS session. A customer may have an
-        // older failed session and a newer paid one for the same appointment.
-        if (transaction?.status === "paid") {
-            paymentState = "paid";
-        } else if (transaction?.status === "failed") {
-            paymentState = "failed";
-        } else if (
-            appointment.paymentStatus === "paid" &&
-            appointment.checkoutSessionId === sessionId
-        ) {
-            paymentState = "paid";
-        }
-
-        const message =
-            paymentState === "paid"
-                ? "Payment verified successfully by the Stripe webhook."
-                : paymentState === "failed"
-                    ? "Stripe reported that this payment failed. No successful transaction was recorded."
-                    : "Payment is still being verified. If you just completed checkout, please wait a few seconds and refresh.";
-
-        return sendSuccess(res, message, {
-            status: paymentState,
-            appointmentId: String(appointment._id),
-            paymentStatus: appointment.paymentStatus,
-            amount: appointment.servicePrice,
-            currency: STRIPE_CURRENCY,
-            verifiedByWebhook: paymentState === "paid",
-            transaction: normalizeTransaction(transaction),
-        });
-    },
-);
+    return sendSuccess(res, message, {
+        status: paymentState,
+        appointmentId: String(appointment._id),
+        paymentStatus: appointment.paymentStatus,
+        amount: appointment.servicePrice,
+        currency: STRIPE_CURRENCY,
+        verifiedByWebhook: paymentState === "paid",
+        transaction: normalizeTransaction(transaction),
+    });
+});
 
 // ========================================
-// 17. STRIPE WEBHOOK
+// Stripe Webhook
 // ========================================
 
 function isTransactionUnsupportedError(error) {
@@ -2779,15 +2553,11 @@ function isTransactionUnsupportedError(error) {
     );
 }
 
-// Check that the signed Stripe event belongs to this application and that the
-// appointment, customer, service, currency and amount all match the database.
 async function getVerifiedCheckoutContext(checkoutSession) {
     const appointmentId = checkoutSession.metadata?.appointmentId;
     const customerId = checkoutSession.metadata?.customerId;
     const serviceId = checkoutSession.metadata?.serviceId;
 
-    // A session without our metadata was not created by this API. Acknowledge
-    // the event without changing any data.
     if (!appointmentId || !customerId) {
         return null;
     }
@@ -2845,9 +2615,6 @@ async function getVerifiedCheckoutContext(checkoutSession) {
     return appointment;
 }
 
-// Save the appointment payment and its transaction together. Atlas supports
-// multi-document transactions; a standalone local MongoDB uses sequential
-// writes instead.
 async function recordSuccessfulPayment(appointment, checkoutSession, event) {
     const existingPaidTransaction = await transactionsCollection.findOne({
         stripeSessionId: checkoutSession.id,
@@ -2952,8 +2719,6 @@ async function handleSuccessfulCheckoutEvent(event) {
     }
 
     if (checkoutSession.payment_status !== "paid") {
-        // Some asynchronous payment methods complete the Checkout Session
-        // before the money arrives. Wait for async_payment_succeeded.
         await appointmentsCollection.updateOne(
             {
                 checkoutSessionId: checkoutSession.id,
@@ -2985,8 +2750,6 @@ async function handleSuccessfulCheckoutEvent(event) {
 async function handleFailedCheckoutEvent(event) {
     const checkoutSession = event.data.object;
 
-    // A failure event must never overwrite a session Stripe currently reports
-    // as paid.
     if (checkoutSession.payment_status === "paid") {
         return { ignored: true };
     }
@@ -3032,13 +2795,11 @@ async function handleFailedCheckoutEvent(event) {
             { upsert: true },
         );
     } catch (error) {
-        // A duplicate event means this failure was already recorded.
         if (error?.code !== 11000) {
             throw error;
         }
     }
 
-    // A failed payment leaves paymentStatus as "unpaid".
     await appointmentsCollection.updateOne(
         {
             _id: appointment._id,
@@ -3064,7 +2825,6 @@ async function handleExpiredCheckoutEvent(event) {
         return { ignored: true };
     }
 
-    // Expiration never changes paymentStatus. A paid appointment stays paid.
     await appointmentsCollection.updateOne(
         {
             _id: appointment._id,
@@ -3098,7 +2858,7 @@ async function processStripeEvent(event) {
     }
 }
 
-async function stripeWebhookHandler(req, res) {
+async function stripeWebhookHandler(req, res, next) {
     if (!stripe || !STRIPE_WEBHOOK_SECRET) {
         return sendError(
             res,
@@ -3130,7 +2890,6 @@ async function stripeWebhookHandler(req, res) {
             STRIPE_WEBHOOK_SECRET,
         );
     } catch {
-        // Never log the signature or raw request body.
         console.warn("Stripe webhook signature verification failed.");
         return sendError(res, 400, "Invalid Stripe webhook signature.");
     }
@@ -3161,19 +2920,15 @@ async function stripeWebhookHandler(req, res) {
             "Stripe webhook processing failed:",
             error?.code || error?.name || "UnknownError",
         );
+
         return sendError(res, 500, "Stripe webhook processing failed.");
     }
 }
 
 // ========================================
-// 18. TRANSACTION APIS
+// Transactions Related APIs
 // ========================================
 
-/**
- * Add appointment/service data (and optionally customer data) to transaction
- * rows. Transactions store references, while appointment snapshots keep the
- * historical service name, image and duration available.
- */
 async function attachTransactionDetails(transactions, includeCustomer) {
     if (transactions.length === 0) {
         return [];
@@ -3277,29 +3032,16 @@ async function respondWithTransactions(req, res, includeCustomer) {
     });
 }
 
-// A customer's own payment history.
-app.get(
-    "/api/transactions/my",
-    verifyToken,
-    verifyCustomer,
-    async (req, res) => {
-        return respondWithTransactions(req, res, false);
-    },
-);
+app.get("/api/transactions/my", verifyToken, verifyCustomer, async (req, res) => {
+    return respondWithTransactions(req, res, false);
+});
 
-// All payment history (admin only). Transactions are read-only here: there is
-// intentionally no API for changing payment status manually.
-app.get(
-    "/api/admin/transactions",
-    verifyToken,
-    verifyAdmin,
-    async (req, res) => {
-        return respondWithTransactions(req, res, true);
-    },
-);
+app.get("/api/admin/transactions", verifyToken, verifyAdmin, async (req, res) => {
+    return respondWithTransactions(req, res, true);
+});
 
 // ========================================
-// 19. ERROR HANDLING
+// Error Handling
 // ========================================
 
 function notFoundHandler(req, res) {
@@ -3311,10 +3053,6 @@ function notFoundHandler(req, res) {
     );
 }
 
-/**
- * Centralized error handler. Internal error details and stack traces are
- * logged on the server but never returned to the client.
- */
 function errorHandler(error, req, res, next) {
     if (res.headersSent) {
         return next(error);
@@ -3400,7 +3138,7 @@ function errorHandler(error, req, res, next) {
 }
 
 // ========================================
-// 20. SERVER INITIALIZATION
+// Server Initialization
 // ========================================
 
 app.get("/", (req, res) => {
@@ -3524,9 +3262,6 @@ async function startServer() {
         }, 10000);
         forceExitTimer.unref();
 
-        // Let Node stop accepting new connections and give in-flight requests a
-        // short chance to finish. closeAllConnections is a safety net for idle
-        // keep-alive sockets.
         const closeServerPromise = new Promise((resolve) => {
             server.close(() => resolve());
         });
@@ -3571,17 +3306,6 @@ async function startServer() {
     });
 }
 
-/**
- * Secure CLI-only admin promotion.
- *
- * Usage:
- *   node index.js promote-admin admin@example.com
- * or:
- *   npm run promote-admin -- admin@example.com
- *
- * The account must already exist through Better Auth, and the email must
- * exactly match ADMIN_EMAIL. No HTTP endpoint can promote administrators.
- */
 async function promoteAdminFromCli() {
     const requestedEmail = (process.argv[3] || "").trim().toLowerCase();
 
@@ -3678,4 +3402,3 @@ if (IS_ADMIN_PROMOTION_COMMAND) {
         process.exit(1);
     });
 }
-
