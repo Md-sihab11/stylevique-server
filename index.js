@@ -889,6 +889,52 @@ async function uploadImageToImgBB(file) {
 }
 
 // ========================================
+// Image Upload API
+// ========================================
+
+/**
+ * POST /api/uploads/image
+ * Stores one image on ImgBB and returns its public URL.
+ * Used by the profile form and the admin service form.
+ */
+app.post(
+    "/api/uploads/image",
+    uploadLimiter,
+    verifyToken,
+    imageUpload.single("image"),
+    async (req, res) => {
+        if (!IMGBB_API_KEY) {
+            return sendError(
+                res,
+                503,
+                "Image uploads are not configured yet. Add IMGBB_API_KEY on the server.",
+            );
+        }
+
+        if (!req.file || !req.file.buffer?.length) {
+            return sendError(res, 422, "Choose an image to upload.", [
+                {
+                    field: "image",
+                    message: "A JPEG, PNG, WebP or GIF image is required.",
+                },
+            ]);
+        }
+
+        if (!hasValidImageSignature(req.file.buffer, req.file.mimetype)) {
+            return sendError(
+                res,
+                422,
+                "The file contents do not match a supported image type.",
+            );
+        }
+
+        const url = await uploadImageToImgBB(req.file);
+
+        return sendSuccess(res, "Image uploaded successfully.", { url }, 201);
+    },
+);
+
+// ========================================
 // Services Related APIs
 // ========================================
 
@@ -1058,6 +1104,29 @@ app.get("/api/admin/services", verifyToken, verifyAdmin, async (req, res) => {
     return sendSuccess(res, "Services retrieved successfully.", {
         services: services.map(normalizeService),
         pagination: buildPagination(page, limit, totalItems),
+    });
+});
+
+/**
+ * GET /api/admin/services/:id
+ * Returns one service regardless of its status so the admin edit form can
+ * load inactive services too.
+ */
+app.get("/api/admin/services/:id", verifyToken, verifyAdmin, async (req, res) => {
+    if (!ObjectId.isValid(req.params.id)) {
+        return sendError(res, 404, "Service not found.");
+    }
+
+    const service = await servicesCollection.findOne({
+        _id: new ObjectId(req.params.id),
+    });
+
+    if (!service) {
+        return sendError(res, 404, "Service not found.");
+    }
+
+    return sendSuccess(res, "Service retrieved successfully.", {
+        service: normalizeService(service),
     });
 });
 
