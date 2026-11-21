@@ -831,10 +831,10 @@ const myTransactions = await apiRequest("/api/transactions/my?page=1&limit=20");
 ## Client Repository
 
 ```text
-Client repository: <add your Next.js repository URL here>
+Client repository: https://github.com/Md-sihab11/stylevique-clientSide
 ```
 
-The frontend project is intentionally not modified by this backend implementation. See the integration section above for the required Better Auth JWT plugin and environment changes.
+The frontend is a separate Next.js repository. See the integration section above for the required Better Auth JWT plugin and environment changes.
 
 ## Live Site
 
