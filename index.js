@@ -190,6 +190,7 @@ let usersCollection = null;
 let servicesCollection = null;
 let appointmentsCollection = null;
 let transactionsCollection = null;
+let reviewsCollection = null;
 let supportsTransactions = false;
 
 async function connectToMongoDB() {
@@ -220,6 +221,7 @@ async function connectToMongoDB() {
         servicesCollection = database.collection("services");
         appointmentsCollection = database.collection("appointments");
         transactionsCollection = database.collection("transactions");
+        reviewsCollection = database.collection("reviews");
 
         const serverInfo = await database.command({ hello: 1 });
         supportsTransactions =
@@ -308,8 +310,24 @@ async function ensureDatabaseIndexes() {
             partialFilterExpression: { stripeEventId: { $type: "string" } },
         },
     );
+    await reviewsCollection.createIndex(
+        { appointmentId: 1 },
+        {
+            name: "reviews_unique_appointment",
+            unique: true,
+            partialFilterExpression: { appointmentId: { $type: "string" } },
+        },
+    );
+    await reviewsCollection.createIndex(
+        { status: 1, createdAt: -1 },
+        { name: "reviews_status_created" },
+    );
+    await reviewsCollection.createIndex(
+        { serviceId: 1, status: 1 },
+        { name: "reviews_service_status" },
+    );
 
-    return 14;
+    return 17;
 }
 
 // ========================================
@@ -492,6 +510,28 @@ function normalizeTransaction(transaction) {
         paymentIntentId: transaction.paymentIntentId ?? null,
         status: transaction.status,
         createdAt: transaction.createdAt,
+    };
+}
+
+function normalizeReview(review) {
+    if (!review) {
+        return null;
+    }
+
+    return {
+        id: String(review._id),
+        appointmentId: String(review.appointmentId),
+        customerId: review.customerId,
+        customerName: review.customerName ?? "",
+        serviceId: review.serviceId ?? null,
+        serviceName: review.serviceName ?? "",
+        serviceImage: review.serviceImage ?? null,
+        rating: review.rating,
+        highlights: Array.isArray(review.highlights) ? review.highlights : [],
+        note: review.note ?? "",
+        status: review.status,
+        createdAt: review.createdAt,
+        updatedAt: review.updatedAt,
     };
 }
 
@@ -1500,6 +1540,23 @@ const APPOINTMENT_STATUSES = Object.freeze([
     "confirmed",
     "cancelled",
 ]);
+
+// ========================================
+// Reviews Related APIs
+// ========================================
+
+const REVIEW_RATING_MIN = 1;
+const REVIEW_RATING_MAX = 5;
+const REVIEW_STATUSES = Object.freeze(["pending", "approved", "rejected"]);
+const REVIEW_HIGHLIGHTS = Object.freeze([
+    "Calm & Unhurried",
+    "Clear Pricing",
+    "Attentive Specialist",
+    "Clean & Peaceful",
+    "Great Results",
+    "On Time",
+]);
+const REVIEW_NOTE_MAX_LENGTH = 500;
 
 async function attachCustomerInformation(appointments) {
     const customerIds = appointments.map((appointment) => appointment.customerId);
@@ -3108,6 +3165,461 @@ app.get("/api/transactions/my", verifyToken, verifyCustomer, async (req, res) =>
 app.get("/api/admin/transactions", verifyToken, verifyAdmin, async (req, res) => {
     return respondWithTransactions(req, res, true);
 });
+
+// ========================================
+// Review Routes
+// ========================================
+
+function validateReviewFields(body) {
+    const errors = [];
+    const allowedFields = ["appointmentId", "rating", "highlights", "note"];
+
+    for (const field of Object.keys(body)) {
+        if (!allowedFields.includes(field)) {
+            errors.push({
+                field,
+                message: "Only appointmentId, rating, highlights and note are allowed.",
+            });
+        }
+    }
+
+    const rating = body.rating;
+    if (
+        !Number.isInteger(rating) ||
+        rating < REVIEW_RATING_MIN ||
+        rating > REVIEW_RATING_MAX
+    ) {
+        errors.push({
+            field: "rating",
+            message: "Choose a rating between 1 and 5.",
+        });
+    }
+
+    const rawHighlights = body.highlights;
+    let highlights = [];
+
+    if (rawHighlights !== undefined && !Array.isArray(rawHighlights)) {
+        errors.push({
+            field: "highlights",
+            message: "Highlights must be a list of the offered labels.",
+        });
+    } else if (Array.isArray(rawHighlights)) {
+        if (rawHighlights.length > 4) {
+            errors.push({
+                field: "highlights",
+                message: "Choose at most four highlights.",
+            });
+        }
+        highlights = [...new Set(rawHighlights.filter((item) => typeof item === "string"))];
+        for (const highlight of highlights) {
+            if (!REVIEW_HIGHLIGHTS.includes(highlight)) {
+                errors.push({
+                    field: "highlights",
+                    message: "One or more highlights are not offered by the salon.",
+                });
+                break;
+            }
+        }
+    }
+
+    const note =
+        body.note === undefined
+            ? ""
+            : typeof body.note === "string"
+                ? body.note.trim()
+                : null;
+
+    if (note === null || note.length > REVIEW_NOTE_MAX_LENGTH) {
+        errors.push({
+            field: "note",
+            message: `Note must be text with ${REVIEW_NOTE_MAX_LENGTH} characters or fewer.`,
+        });
+    }
+
+    return { errors, rating, highlights, note };
+}
+
+app.post("/api/reviews", verifyToken, verifyCustomer, async (req, res) => {
+    const body = req.body || {};
+    const parsed = validateReviewFields(body);
+
+    const appointmentId =
+        typeof body.appointmentId === "string" ? body.appointmentId.trim() : "";
+
+    if (!ObjectId.isValid(appointmentId)) {
+        parsed.errors.push({
+            field: "appointmentId",
+            message: "Appointment ID must be a valid MongoDB ObjectId.",
+        });
+    }
+
+    if (parsed.errors.length > 0) {
+        return sendError(
+            res,
+            422,
+            "Validation failed. Please check the submitted fields.",
+            parsed.errors,
+        );
+    }
+
+    const appointment = await appointmentsCollection.findOne({
+        _id: new ObjectId(appointmentId),
+    });
+
+    if (!appointment) {
+        return sendError(res, 404, "Appointment not found.");
+    }
+
+    if (appointment.customerId !== req.user.id) {
+        return sendError(res, 403, "You can only review your own appointments.");
+    }
+
+    if (appointment.status !== "confirmed") {
+        return sendError(
+            res,
+            409,
+            "Only completed visits can be reviewed.",
+        );
+    }
+
+    const visitDateTime = parseAppointmentDateTime(
+        appointment.appointmentDate,
+        appointment.timeSlot,
+    );
+
+    if (!visitDateTime || visitDateTime.getTime() > Date.now()) {
+        return sendError(
+            res,
+            409,
+            "You can review this visit after its appointment time has passed.",
+        );
+    }
+
+    const alreadyReviewed = await reviewsCollection.findOne({ appointmentId });
+    if (alreadyReviewed) {
+        return sendError(
+            res,
+            409,
+            "You have already reviewed this appointment.",
+        );
+    }
+
+    const now = new Date();
+    const reviewDocument = {
+        appointmentId,
+        customerId: req.user.id,
+        customerName: req.user.name || "Stylevique customer",
+        serviceId: appointment.serviceId ? String(appointment.serviceId) : null,
+        serviceName: appointment.serviceSnapshot?.serviceName ?? "Salon service",
+        serviceImage: appointment.serviceSnapshot?.image ?? null,
+        rating: parsed.rating,
+        highlights: parsed.highlights,
+        note: parsed.note,
+        status: "pending",
+        createdAt: now,
+        updatedAt: now,
+    };
+
+    try {
+        const result = await reviewsCollection.insertOne(reviewDocument);
+
+        return sendSuccess(
+            res,
+            "Thank you. Your review was submitted for approval.",
+            { review: normalizeReview({ ...reviewDocument, _id: result.insertedId }) },
+            201,
+        );
+    } catch (error) {
+        if (error?.code === 11000) {
+            return sendError(
+                res,
+                409,
+                "You have already reviewed this appointment.",
+            );
+        }
+        throw error;
+    }
+});
+
+app.get("/api/reviews/summary", async (req, res) => {
+    const serviceId = String(req.query.serviceId || "").trim();
+    const filter = { status: "approved" };
+
+    if (serviceId) {
+        if (!ObjectId.isValid(serviceId)) {
+            return sendError(res, 422, "Invalid query parameters.", [
+                { field: "serviceId", message: "Service ID must be a valid MongoDB ObjectId." },
+            ]);
+        }
+        filter.serviceId = serviceId;
+    }
+
+    const [summary] = await reviewsCollection
+        .aggregate([
+            { $match: filter },
+            {
+                $group: {
+                    _id: null,
+                    totalReviews: { $sum: 1 },
+                    averageRating: { $avg: "$rating" },
+                },
+            },
+        ])
+        .toArray();
+
+    return sendSuccess(res, "Review summary retrieved successfully.", {
+        totalReviews: summary?.totalReviews ?? 0,
+        averageRating: summary ? Math.round(summary.averageRating * 10) / 10 : 0,
+    });
+});
+
+app.get("/api/reviews/my", verifyToken, verifyCustomer, async (req, res) => {
+    const page = Number(req.query.page || 1);
+    const limit = Number(req.query.limit || 20);
+
+    if (!Number.isInteger(page) || page < 1) {
+        return sendError(res, 422, "Invalid query parameters.", [
+            { field: "page", message: "Page must be a positive whole number." },
+        ]);
+    }
+
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+        return sendError(res, 422, "Invalid query parameters.", [
+            { field: "limit", message: "Limit must be between 1 and 100." },
+        ]);
+    }
+
+    const filter = { customerId: req.user.id };
+    const skip = (page - 1) * limit;
+    const [reviews, totalItems] = await Promise.all([
+        reviewsCollection
+            .find(filter)
+            .sort({ createdAt: -1 })
+            .skip(skip)
+            .limit(limit)
+            .toArray(),
+        reviewsCollection.countDocuments(filter),
+    ]);
+
+    return sendSuccess(res, "Your reviews were retrieved successfully.", {
+        reviews: reviews.map(normalizeReview),
+        pagination: buildPagination(page, limit, totalItems),
+    });
+});
+
+app.patch("/api/reviews/:id", verifyToken, verifyCustomer, async (req, res) => {
+    if (!ObjectId.isValid(req.params.id)) {
+        return sendError(res, 400, "Invalid review ID.");
+    }
+
+    const body = req.body || {};
+    // Editing an existing review replaces these fields; appointmentId and
+    // customer ownership stay fixed by the server.
+    const parsed = validateReviewFields({
+        rating: body.rating,
+        highlights: body.highlights,
+        note: body.note,
+    });
+
+    if (parsed.errors.length > 0) {
+        return sendError(
+            res,
+            422,
+            "Validation failed. Please check the submitted fields.",
+            parsed.errors,
+        );
+    }
+
+    const review = await reviewsCollection.findOne({
+        _id: new ObjectId(req.params.id),
+    });
+
+    if (!review) {
+        return sendError(res, 404, "Review not found.");
+    }
+
+    if (review.customerId !== req.user.id) {
+        return sendError(res, 403, "You can only edit your own reviews.");
+    }
+
+    if (review.status !== "rejected") {
+        return sendError(
+            res,
+            409,
+            "Only rejected reviews can be edited and resubmitted.",
+        );
+    }
+
+    const updatedAt = new Date();
+    await reviewsCollection.updateOne(
+        { _id: review._id },
+        {
+            $set: {
+                rating: parsed.rating,
+                highlights: parsed.highlights,
+                note: parsed.note,
+                status: "pending",
+                updatedAt,
+            },
+            $unset: { rejectionReason: "" },
+        },
+    );
+
+    return sendSuccess(res, "Your review was resubmitted for approval.", {
+        review: normalizeReview({
+            ...review,
+            rating: parsed.rating,
+            highlights: parsed.highlights,
+            note: parsed.note,
+            status: "pending",
+            updatedAt,
+        }),
+    });
+});
+
+app.get("/api/reviews", async (req, res) => {
+    const page = Number(req.query.page || 1);
+    const limit = Number(req.query.limit || 12);
+    const serviceId = String(req.query.serviceId || "").trim();
+
+    if (!Number.isInteger(page) || page < 1) {
+        return sendError(res, 422, "Invalid query parameters.", [
+            { field: "page", message: "Page must be a positive whole number." },
+        ]);
+    }
+
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+        return sendError(res, 422, "Invalid query parameters.", [
+            { field: "limit", message: "Limit must be between 1 and 100." },
+        ]);
+    }
+
+    const filter = { status: "approved" };
+
+    if (serviceId) {
+        if (!ObjectId.isValid(serviceId)) {
+            return sendError(res, 422, "Invalid query parameters.", [
+                {
+                    field: "serviceId",
+                    message: "Service ID must be a valid MongoDB ObjectId.",
+                },
+            ]);
+        }
+        filter.serviceId = serviceId;
+    }
+
+    const skip = (page - 1) * limit;
+    const [reviews, totalItems] = await Promise.all([
+        reviewsCollection
+            .find(filter)
+            .sort({ createdAt: -1 })
+            .skip(skip)
+            .limit(limit)
+            .toArray(),
+        reviewsCollection.countDocuments(filter),
+    ]);
+
+    return sendSuccess(res, "Reviews retrieved successfully.", {
+        reviews: reviews.map(normalizeReview),
+        pagination: buildPagination(page, limit, totalItems),
+    });
+});
+
+app.get("/api/admin/reviews", verifyToken, verifyAdmin, async (req, res) => {
+    const page = Number(req.query.page || 1);
+    const limit = Number(req.query.limit || 20);
+    const status = String(req.query.status || "");
+
+    if (!Number.isInteger(page) || page < 1) {
+        return sendError(res, 422, "Invalid query parameters.", [
+            { field: "page", message: "Page must be a positive whole number." },
+        ]);
+    }
+
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+        return sendError(res, 422, "Invalid query parameters.", [
+            { field: "limit", message: "Limit must be between 1 and 100." },
+        ]);
+    }
+
+    if (status && !REVIEW_STATUSES.includes(status)) {
+        return sendError(res, 422, "Invalid query parameters.", [
+            {
+                field: "status",
+                message: "Status must be pending, approved or rejected.",
+            },
+        ]);
+    }
+
+    const filter = status ? { status } : {};
+    const skip = (page - 1) * limit;
+    const [reviews, totalItems] = await Promise.all([
+        reviewsCollection
+            .find(filter)
+            .sort({ createdAt: -1 })
+            .skip(skip)
+            .limit(limit)
+            .toArray(),
+        reviewsCollection.countDocuments(filter),
+    ]);
+
+    return sendSuccess(res, "Reviews retrieved successfully.", {
+        reviews: reviews.map(normalizeReview),
+        pagination: buildPagination(page, limit, totalItems),
+    });
+});
+
+app.patch(
+    "/api/admin/reviews/:id/status",
+    verifyToken,
+    verifyAdmin,
+    async (req, res) => {
+        if (!ObjectId.isValid(req.params.id)) {
+            return sendError(res, 400, "Invalid review ID.");
+        }
+
+        const status = req.body?.status;
+        if (!["approved", "rejected"].includes(status)) {
+            return sendError(res, 422, "Invalid status.", [
+                {
+                    field: "status",
+                    message: "Status must be approved or rejected.",
+                },
+            ]);
+        }
+
+        const review = await reviewsCollection.findOne({
+            _id: new ObjectId(req.params.id),
+        });
+
+        if (!review) {
+            return sendError(res, 404, "Review not found.");
+        }
+
+        const now = new Date();
+        await reviewsCollection.updateOne(
+            { _id: review._id },
+            {
+                $set: {
+                    status,
+                    reviewedAt: now,
+                    reviewedBy: req.user.id,
+                    updatedAt: now,
+                },
+            },
+        );
+
+        return sendSuccess(res, `Review ${status} successfully.`, {
+            review: normalizeReview({
+                ...review,
+                status,
+                reviewedAt: now,
+                reviewedBy: req.user.id,
+                updatedAt: now,
+            }),
+        });
+    },
+);
 
 // ========================================
 // Error Handling

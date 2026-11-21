@@ -173,6 +173,7 @@ Better Auth's MongoDB adapter normally stores the primary key in `_id` (an Objec
 - Transactions: `{ customerId, createdAt }`, `{ appointmentId }`, `{ status, createdAt }`
 - Transactions: **unique partial** index on `stripeSessionId`
 - Transactions: **unique partial** index on `stripeEventId`
+- Reviews: **unique partial** index on `appointmentId`, `{ status, createdAt }`, `{ serviceId, status }`
 - Users: `{ role, createdAt }`
 
 The unique partial index is what prevents two concurrent requests from booking the same date and time slot. A pre-check also exists for a friendly error, but the database index is the real guarantee.
@@ -660,6 +661,24 @@ The response includes `checkoutUrl`, `sessionId`, `appointmentId`, `amount` and 
 Both support `status=paid|failed`, `page` and `limit`.
 
 Transactions are read-only. There is intentionally no endpoint for creating, editing or deleting transactions or manually marking an appointment as paid.
+
+### Reviews
+
+| Method | Endpoint | Access | Description |
+| --- | --- | --- | --- |
+| `POST` | `/api/reviews` | Customer | Review a completed visit; saved as `pending` |
+| `GET` | `/api/reviews` | Public | Approved reviews only; `serviceId`, `page`, `limit` |
+| `GET` | `/api/reviews/summary` | Public | Average rating + count from approved reviews |
+| `GET` | `/api/reviews/my` | Customer | Own reviews with moderation status |
+| `PATCH` | `/api/reviews/:id` | Customer | Edit and resubmit a rejected review |
+| `GET` | `/api/admin/reviews` | Admin | All reviews; `status`, `page`, `limit` |
+| `PATCH` | `/api/admin/reviews/:id/status` | Admin | Approve or reject a review |
+
+A review requires a customer's own **confirmed** appointment whose visit time
+has passed, and only one review is allowed per appointment. `rating` is 1–5,
+`highlights` is a subset of the salon's six labels, and `note` is at most 500
+characters. New and resubmitted reviews are `pending`; only `approved` reviews
+are returned publicly. The backend decides approval — the client never does.
 
 ---
 
