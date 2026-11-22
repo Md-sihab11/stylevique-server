@@ -2,6 +2,8 @@
 
 Stylevique Server is the REST API for **Stylevique**, a full-stack salon appointment booking platform. It manages salon services, appointment bookings, customers, reviews, dashboard statistics, image uploads, and Stripe payments.
 
+> This repository implements the **SalonBook – Salon Appointment Booking Platform** assignment brief; the product is branded **Stylevique**.
+
 The backend is built with Express.js and MongoDB Atlas using the native MongoDB driver. Authentication is managed by Better Auth in the Next.js frontend, while the Express API verifies JWTs to protect private endpoints.
 
 ---
