@@ -201,7 +201,7 @@ The backend never trusts a role supplied by the browser and never trusts old rol
 
 ### 2. Frontend auth server configuration (required)
 
-The existing frontend auth config in `src/lib/auth.ts` already references `jwt(...)`, but **it does not import it** in the current version. Add the import and the user fields:
+The frontend auth config in `src/lib/auth.ts` already imports and enables the `jwt()` plugin and declares the user fields below. Keep it in sync with the backend when changing JWT options:
 
 ```ts
 // src/lib/auth.ts
@@ -251,13 +251,10 @@ export const auth = betterAuth({
     },
   },
 
-  plugins: [
-    jwt({ sessionCookieCache: true }),
-  ],
+  plugins: [jwt()],
   session: {
     cookieCache: {
       enabled: true,
-      strategy: "jwt",
       maxAge: 7 * 24 * 60 * 60,
     },
   },
@@ -275,16 +272,20 @@ If you set custom `jwt.issuer`, `jwt.audience` or a custom JWKS path in Better A
 
 ### 3. Frontend auth client configuration (required)
 
-The current `src/lib/auth-client.ts` creates a configured client and then exports actions from a second unconfigured client. Use one client and add the JWT client plugin:
+The frontend `src/lib/auth-client.ts` already uses a single configured client with the JWT client plugin and inferred user fields, as shown below:
 
 ```ts
 // src/lib/auth-client.ts
 import { createAuthClient } from "better-auth/react";
-import { jwtClient } from "better-auth/client/plugins";
+import {
+  inferAdditionalFields,
+  jwtClient,
+} from "better-auth/client/plugins";
+import type { auth } from "@/lib/auth/auth";
 
 export const authClient = createAuthClient({
   baseURL: process.env.NEXT_PUBLIC_APP_URL ?? "http://localhost:3000",
-  plugins: [jwtClient()],
+  plugins: [jwtClient(), inferAdditionalFields<typeof auth>()],
 });
 
 export const { signIn, signUp, signOut, useSession } = authClient;
@@ -847,10 +848,11 @@ const myTransactions = await apiRequest("/api/transactions/my?page=1&limit=20");
 
 ---
 
-## Client Repository
+## Repository Links
 
 ```text
 Client repository: https://github.com/Md-sihab11/stylevique-clientSide
+Server repository: https://github.com/Md-sihab11/stylevique-server
 ```
 
 The frontend is a separate Next.js repository. See the integration section above for the required Better Auth JWT plugin and environment changes.
@@ -858,11 +860,27 @@ The frontend is a separate Next.js repository. See the integration section above
 ## Live Site
 
 ```text
-Live site: <add your deployed frontend URL here>
-Live API: <add your deployed backend URL here>
+Live site: https://stylevique.vercel.app
+Live API: https://stylevique-server.onrender.com
 ```
 
-No deployment links are invented. Add real links after deployment.
+---
+
+## Deployment guideline
+
+1. Deploy the Express API first (Render). Set every variable from the environment table, including `CLIENT_URL` to the live frontend origin.
+2. Confirm the API responds on `/api/services` and that CORS accepts the frontend origin.
+3. Deploy the Next.js client (Vercel) with `NEXT_PUBLIC_API_URL` pointing at the live API, without a trailing slash.
+4. Set `BETTER_AUTH_URL` on both apps to the frontend origin and keep `BETTER_AUTH_SECRET`, `MONGODB_URI`, `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, Stripe keys, `IMG_API_KEY` and `ADMIN_EMAIL` in the platform environment settings — never in Git.
+5. Register the Stripe webhook at `https://stylevique-server.onrender.com/api/payments/webhook` for `checkout.session.completed`, and set `STRIPE_WEBHOOK_SECRET` from the endpoint signing secret.
+6. Promote the evaluation admin with `npm run promote-admin -- <email>` after that user signs up once.
+7. Verify the live site: no CORS/404/504 errors, private routes survive refresh, session persists, and Stripe Checkout plus the webhook mark the appointment paid and record a transaction.
+
+---
+
+## Evaluation admin access
+
+Admin accounts are never created through public registration. An account is promoted by setting `ADMIN_EMAIL` in the server environment and running `npm run promote-admin -- <email>`. The credentials submitted for evaluation use that promoted account; no admin secret is stored in either repository.
 
 ---
 
